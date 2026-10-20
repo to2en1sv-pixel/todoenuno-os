@@ -1,0 +1,58 @@
+services:
+  redis:
+    image: redis:alpine
+    volumes:
+      - redis_data:/data
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-todouno123}
+      POSTGRES_DB: evolution
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+  evolution:
+    image: evoapicloud/evolution-api:v2.2.2
+    ports:
+      - "8080:8080"
+    environment:
+      - SERVER_TYPE=http
+      - SERVER_PORT=8080
+      - SERVER_URL=${SERVER_URL:-http://67.205.174.134:8080}
+      - AUTHENTICATION_TYPE=apikey
+      - AUTHENTICATION_API_KEY=${AUTHENTICATION_API_KEY:-todouno123}
+      - AUTHENTICATION_EXPOSE_IN_FETCH_INSTANCES=true
+      - DATABASE_ENABLED=true
+      - DATABASE_PROVIDER=postgresql
+      - DATABASE_CONNECTION_URI=postgresql://postgres:${POSTGRES_PASSWORD:-todouno123}@postgres:5432/evolution
+      - REDIS_ENABLED=true
+      - REDIS_URI=redis://redis:6379
+      - CACHE_REDIS_ENABLED=true
+      - CACHE_REDIS_URI=redis://redis:6379
+      - WEBHOOK_GLOBAL_URL=http://n8n:5678/webhook/evolution-whatsapp
+      - WEBHOOK_GLOBAL_ENABLED=true
+    volumes:
+      - evolution_instances:/evolution/instances
+      - evolution_store:/evolution/store
+    command: sh -c "rm -f .env src/.env /evolution/.env 2>/dev/null; npm run start:prod"
+    depends_on:
+      - redis
+      - postgres
+  n8n:
+    image: n8nio/n8n:latest
+    ports:
+      - "5678:5678"
+    environment:
+      - N8N_SECURE_COOKIE=false
+      - N8N_HOST=${N8N_HOST:-67.205.174.134}
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      - GENERIC_TIMEZONE=America/El_Salvador
+    volumes:
+      - n8n_data:/home/node/.n8n
+volumes:
+  pgdata:
+  redis_data:
+  evolution_instances:
+  evolution_store:
+  n8n_data:

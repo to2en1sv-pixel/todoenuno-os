@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS protected_contacts (phone TEXT PRIMARY KEY);

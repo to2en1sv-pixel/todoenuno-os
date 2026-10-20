@@ -1,0 +1,267 @@
+{
+  "name": "Ecommerce Bot Potente - Evolution + OpenAI + Supabase + Odoo",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "evolution-whatsapp",
+        "options": {}
+      },
+      "id": "webhook-evolution",
+      "name": "Webhook WhatsApp",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "webhookId": "evolution-whatsapp",
+      "notes": "Evolution envia aqui cada mensaje. URL interna: http://n8n:5678/webhook/evolution-whatsapp"
+    },
+    {
+      "parameters": {
+        "jsCode": "const body = $input.first().json;\nconst data = body.data || body;\nconst message = data.message || {};\nconst key = data.key || {};\n\n// Extrae numero y texto\nconst remoteJid = key.remoteJid || data.remoteJid || '';\nconst phone = remoteJid.replace('@s.whatsapp.net','').replace('@g.us','');\nconst pushName = data.pushName || '';\nconst text = message.conversation || message.extendedTextMessage?.text || message.imageMessage?.caption || '';\nconst instance = body.instance || 'ecommerce-bot';\n\n// Ignora grupos y mensajes vacios\nif (remoteJid.includes('@g.us') || !text) {\n  return [];\n}\n\nreturn [{ \n  phone, \n  text, \n  pushName, \n  remoteJid,\n  instance,\n  raw: body \n}];"
+      },
+      "id": "set-extract",
+      "name": "Extrae Datos",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        300,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "table": "products",
+        "returnAllMatches": true,
+        "options": {
+          "query": "limit=5"
+        }
+      },
+      "id": "supabase-products",
+      "name": "Supabase - Busca Productos",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        600,
+        -200
+      ],
+      "notes": "Conecta tu credencial de Supabase. Aqui puedes hacer busqueda vectorial despues",
+      "credentials": {
+        "supabaseApi": {
+          "id": "REEMPLAZA_CON_TU_CREDENCIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "select",
+        "table": "conversations",
+        "filters": {
+          "conditions": [
+            {
+              "key": "phone",
+              "operation": "eq",
+              "value": "={{ $json.phone }}"
+            }
+          ]
+        },
+        "options": {
+          "query": "order=created_at.desc&limit=10"
+        }
+      },
+      "id": "supabase-history",
+      "name": "Supabase - Historial Chat",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        600,
+        200
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REEMPLAZA_CON_TU_CREDENCIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "resource": "chat",
+        "operation": "complete",
+        "model": "gpt-4o-mini",
+        "messages": {
+          "values": [
+            {
+              "role": "system",
+              "content": "Eres el mejor vendedor de ecommerce del mundo. Vendes por WhatsApp. Tono: cercano, salvadoreño, directo, sin rodeos. Objetivo: vender, no solo responder.\n\nTienes acceso a:\nProductos: {{ JSON.stringify($('Supabase - Busca Productos').first().json) }}\nHistorial: {{ JSON.stringify($('Supabase - Historial Chat').first().json) }}\n\nReglas:\n1. Si preguntan precio, da precio + beneficio + cierra con pregunta.\n2. Si no hay stock, ofrece alternativa.\n3. Si quieren comprar, pide nombre, direccion y confirma.\n4. Nunca digas que eres IA.\n5. Respuestas cortas, max 3 lineas para WhatsApp."
+            },
+            {
+              "role": "user",
+              "content": "=Cliente {{ $json.pushName }} ({{ $json.phone }}) dice: {{ $json.text }}"
+            }
+          ]
+        },
+        "simplify": false
+      },
+      "id": "openai-chat",
+      "name": "OpenAI - Cerebro Vendedor",
+      "type": "@n8n/n8n-nodes-langchain.openAi",
+      "typeVersion": 1,
+      "position": [
+        900,
+        0
+      ],
+      "credentials": {
+        "openAiApi": {
+          "id": "REEMPLAZA_CON_TU_CREDENCIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://evolution:8080/message/sendText/{{ $json.instance || $node[\"Extrae Datos\"].json[\"instance\"] }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "apikey",
+              "value": "todouno123"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "number",
+              "value": "={{ $('Extrae Datos').item.json.phone }}"
+            },
+            {
+              "name": "text",
+              "value": "={{ $json.message.content || $json.choices[0].message.content }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "http-evolution-send",
+      "name": "Evolution - Responder WhatsApp",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": "conversations",
+        "columns": {
+          "mappingMode": "defineBelow",
+          "mapping": [
+            {
+              "column": "phone",
+              "value": "={{ $('Extrae Datos').item.json.phone }}"
+            },
+            {
+              "column": "role",
+              "value": "user"
+            },
+            {
+              "column": "message",
+              "value": "={{ $('Extrae Datos').item.json.text }}"
+            }
+          ]
+        }
+      },
+      "id": "supabase-save-user",
+      "name": "Supabase - Guarda Mensaje User",
+      "type": "n8n-nodes-base.supabase",
+      "typeVersion": 1,
+      "position": [
+        900,
+        400
+      ],
+      "credentials": {
+        "supabaseApi": {
+          "id": "REEMPLAZA_CON_TU_CREDENCIAL"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook WhatsApp": {
+      "main": [
+        [
+          {
+            "node": "Extrae Datos",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extrae Datos": {
+      "main": [
+        [
+          {
+            "node": "Supabase - Busca Productos",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Supabase - Historial Chat",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Busca Productos": {
+      "main": [
+        [
+          {
+            "node": "OpenAI - Cerebro Vendedor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supabase - Historial Chat": {
+      "main": [
+        [
+          {
+            "node": "OpenAI - Cerebro Vendedor",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI - Cerebro Vendedor": {
+      "main": [
+        [
+          {
+            "node": "Evolution - Responder WhatsApp",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Supabase - Guarda Mensaje User",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "ecommerce-bot"
+  }
+}

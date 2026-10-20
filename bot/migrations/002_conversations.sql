@@ -1,0 +1,1 @@
+CREATE TABLE IF NOT EXISTS conversations (id BIGSERIAL PRIMARY KEY, phone TEXT, role TEXT, message TEXT, created_at TIMESTAMPTZ DEFAULT NOW());

@@ -1,0 +1,1 @@
+{'name':'TodoEnUno Integration','depends':['base','sale']}
