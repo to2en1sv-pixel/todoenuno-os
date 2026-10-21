@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
+import { randomUUID } from 'node:crypto'
 
 export const dynamic = 'force-dynamic'
 export const runtime = 'nodejs'
@@ -13,6 +14,8 @@ const EVO_URL = (process.env.EVOLUTION_API_URL || '').replace(/\/+$/, '')
 const EVO_INSTANCE = process.env.EVOLUTION_INSTANCE || 'eee'
 const EVO_KEY = process.env.EVOLUTION_API_KEY || ''
 const OPENAI_KEY = process.env.OPENAI_API_KEY || ''
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-6-luna'
+const OPENAI_ANALYSIS_TIMEOUT_MS = 5000
 
 const SB_URL_RAW = process.env.SUPABASE_URL || 'https://trgywmhxmkbjfcdvxpnz.supabase.co'
 const SB_URL = SB_URL_RAW.startsWith('http') ? SB_URL_RAW : `https://${SB_URL_RAW}.supabase.co`
@@ -40,6 +43,17 @@ type Estado = {
   last_sku: string | null
 }
 type Conv = { entrada: string; respuesta: string }
+type AnalisisTurno = {
+  intent: 'greeting' | 'catalog' | 'product_question' | 'product_choice' | 'purchase' | 'provide_order_data' | 'cancel' | 'human' | 'how_to_order' | 'other'
+  sku: string
+  nombre_cliente: string
+  direccion: string
+  metodo_pago: '' | 'efectivo' | 'transferencia'
+  respuesta_breve: string
+}
+const ANALISIS_VACIO: AnalisisTurno = {
+  intent: 'other', sku: '', nombre_cliente: '', direccion: '', metodo_pago: '', respuesta_breve: '',
+}
 
 // ============ HELPERS ============
 const norm = (s: string) =>
@@ -157,8 +171,35 @@ async function getHistory(tel: string): Promise<Conv[]> {
     .select('entrada,respuesta')
     .eq('telefono', tel)
     .order('created_at', { ascending: false })
-    .limit(6)
+    .limit(12)
   return ((data as Conv[]) || []).reverse()
+}
+
+// ============ BLOQUEO POR CLIENTE (Supabase/Postgres) ============
+// Requiere ejecutar la migración SQL incluida con este archivo.
+async function adquirirBloqueoCliente(telefono: string, token: string): Promise<boolean> {
+  const fin = Date.now() + 14000
+  do {
+    const { data, error } = await supabase.rpc('claim_whatsapp_processing_lock', {
+      p_telefono: telefono,
+      p_token: token,
+      p_ttl_seconds: 90,
+    })
+    if (error) {
+      console.error('claim whatsapp lock', error.message)
+      return false
+    }
+    if (data === true) return true
+    await sleep(250)
+  } while (Date.now() < fin)
+  return false
+}
+async function liberarBloqueoCliente(telefono: string, token: string) {
+  const { error } = await supabase.rpc('release_whatsapp_processing_lock', {
+    p_telefono: telefono,
+    p_token: token,
+  })
+  if (error) console.error('release whatsapp lock', error.message)
 }
 
 // ============ PRODUCTOS ============
@@ -311,14 +352,19 @@ function buscarProducto(msg: string, disp: Producto[]): Producto | null {
 }
 
 function productoDeUltimaRespuesta(hist: Conv[], disp: Producto[]): Producto | null {
-  const last = hist[hist.length - 1]?.respuesta || ''
-  // Solo recuperar la ficha explícita más reciente; nunca inferir un SKU desde un catálogo general.
-  if (!/¿te lo aparto\?|responde:\s*lo quiero/i.test(last)) return null
-  const match = last.match(/🛍️?\s*\*([^*]+)\*/i)
-  if (!match?.[1]) return null
-  const nombre = norm(match[1])
-  return disp.find(p => norm(p.nombre_completo) === nombre) || null
+  // Recupera la última ficha individual sin depender del texto exacto de la pregunta de venta.
+  // Se exige encabezado al principio para no confundir un catálogo con una selección.
+  for (let i = hist.length - 1; i >= Math.max(0, hist.length - 4); i--) {
+    const last = String(hist[i]?.respuesta || '').trim()
+    const match = last.match(/^🛍️\s*\*([^*]+)\*/i)
+    if (!match?.[1]) continue
+    const nombre = norm(match[1])
+    const found = disp.find(p => norm(p.nombre_completo) === nombre)
+    if (found) return found
+  }
+  return null
 }
+
 function buscarPorTallaColor(msg: string, disp: Producto[]): Producto[] {
   const n = norm(msg)
   return disp
@@ -371,7 +417,7 @@ function faltantes(st: Estado) {
   return f.join('\n')
 }
 
-function recolectar(st: Estado, msg: string) {
+function recolectar(st: Estado, msg: string, analisis: AnalisisTurno = ANALISIS_VACIO) {
   const partes = msg.split(/[|\n;,]+/).map((s) => s.trim()).filter(Boolean)
   let dirDeEste = false
   let algo = false
@@ -396,45 +442,118 @@ function recolectar(st: Estado, msg: string) {
       }
     }
   }
+  // Use structured extraction only for values explicitly present in the current message.
+  if (!st.nombre_cliente && analisis.nombre_cliente && !esDireccion(analisis.nombre_cliente)) {
+    const nom = detectaNombre(analisis.nombre_cliente) || analisis.nombre_cliente.trim()
+    if (nom && nom.length <= 100) st.nombre_cliente = nom
+  }
+  if (!st.direccion && analisis.direccion && analisis.direccion.trim().length >= 5) {
+    st.direccion = analisis.direccion.trim().slice(0, 500)
+  }
+  if (analisis.metodo_pago) st.metodo_pago = analisis.metodo_pago
   if (!algo && !st.direccion && msg.trim().length > 12 && !esPedir(msg)) st.direccion = msg.trim()
 }
 
-// ============ OPENAI (solo respaldo, con catálogo real) ============
-async function openaiFallback(msg: string, hist: Conv[], muestra: string): Promise<string | null> {
-  if (!OPENAI_KEY) return null
-  const ctrl = new AbortController()
-  const t = setTimeout(() => ctrl.abort(), 7000)
-  try {
-    const messages: any[] = [
-      {
-        role: 'system',
-        content:
-          `Eres ${AGENTE}, vendedor salvadoreño de TodoEnUno SV. Hablas de vos, amable, máximo 2 líneas, con emojis. ` +
-          `Cierras ventas y manejas objeciones (precio, confianza, envío). Envío GRATIS 24-72h; pago efectivo o transferencia. ` +
-          `NUNCA digas "no sé" ni "no tengo información". NUNCA inventes productos, precios, tallas ni colores. ` +
-          `Si piden algo que no está, ofrece uno de estos productos reales: ${muestra}. Responde solo texto plano.`,
-      },
-    ]
-    for (const h of hist) {
-      messages.push({ role: 'user', content: h.entrada })
-      messages.push({ role: 'assistant', content: h.respuesta })
+// ============ AGENTE DE INTERPRETACIÓN DE TURNO ============
+// Un único análisis estructurado interpreta el lenguaje natural. Las transiciones de compra
+// y el registro de pedidos siguen siendo deterministas en miniAgente.
+function sanitizarParaModelo(value: string, st: Estado): string {
+  let out = String(value || '')
+  for (const privateValue of [st.nombre_cliente, st.direccion]) {
+    if (privateValue && privateValue.trim().length >= 3) {
+      const escaped = privateValue.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      out = out.replace(new RegExp(escaped, 'gi'), '[DATO_CLIENTE]')
     }
-    messages.push({ role: 'user', content: msg })
-    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+  }
+  return out.slice(0, 1200)
+}
+
+async function analizarTurno(msg: string, st: Estado, disp: Producto[], hist: Conv[]): Promise<AnalisisTurno> {
+  const fallback = { ...ANALISIS_VACIO }
+  if (!OPENAI_KEY) return fallback
+  const ctrl = new AbortController()
+  const timeout = setTimeout(() => ctrl.abort(), OPENAI_ANALYSIS_TIMEOUT_MS)
+  try {
+    const catalogo = disp.slice(0, 120).map(p => ({ sku: p.sku, nombre: p.nombre_completo, precio: p.precioNum, talla: p.talla, color: p.color }))
+    const historial = hist.slice(-12).map(h => ({
+      cliente: sanitizarParaModelo(h.entrada, st),
+      asistente: sanitizarParaModelo(h.respuesta, st),
+    }))
+    const contexto = {
+      mensaje_actual: msg,
+      estado_compra: st.paso || 'inicio',
+      producto_actual: st.last_sku ? { sku: st.last_sku, nombre: st.last_nombre || '' } : null,
+      datos_pedido_ya_guardados: {
+        nombre: Boolean(st.nombre_cliente), direccion: Boolean(st.direccion), pago: Boolean(st.metodo_pago),
+      },
+      historial_reciente: historial,
+      catalogo_real: catalogo,
+    }
+    const instructions = `Eres un microagente de interpretación para el vendedor de WhatsApp ${AGENTE} de TodoEnUno SV. No conversas con el cliente: analiza su intención en contexto y devuelve solo el objeto exigido por el esquema. El cliente puede escribir con errores, abreviaturas, salvadoreñismos, mensajes partidos, pronombres (ese/esa/lo), sin tildes o con muchas formas equivalentes. Lee el historial reciente y el estado de compra antes de clasificar.\n` +
+      `intents: greeting=saludo; catalog=pide catálogo/más productos; product_question=pregunta información/precio de producto; product_choice=menciona o selecciona producto; purchase=quiere comprar/encargar/recibir el producto o confirma que sí lo quiere; provide_order_data=da nombre, dirección o forma de pago; cancel=desiste; human=pide asesor/persona; how_to_order=pregunta cómo comprar; other=resto.\n` +
+      `Cuando el estado sea esperando_producto_para_comprar, un producto mencionado debe interpretarse como el producto que quiere comprar y NO debes volver a preguntar si lo quiere. También revisa el historial: si la persona ya dijo que quiere comprar y el asistente le pidió identificar/escribir el producto, su siguiente nombre de producto continúa esa compra aunque el estado guardado diga info/inicio. Cuando la última ficha individual o el estado identifique un producto, mensajes como "sí", "dale", "va", "me lo llevo", "mandamelo", "quiero ese", "hágale", "de una", "lo quiero" pueden confirmar compra. Si está recolectando datos, interpreta el mensaje como datos del pedido cuando corresponda; nunca confundas el nombre de un producto con el nombre de la persona.\n` +
+      `sku debe ser únicamente un SKU literal del catálogo proporcionado; usa cadena vacía si no puedes determinarlo. No inventes SKUs ni datos personales. nombre_cliente, direccion, metodo_pago solo deben contener información explícita del mensaje_actual, no la deduzcas de mensajes antiguos; si no aparece en el mensaje actual, usa cadena vacía. metodo_pago solo puede ser efectivo o transferencia; acepta equivalencias como "contra entrega", "cuando llegue" y "le pago al recibir" para efectivo, y "depósito" o "por banco" para transferencia.\n` +
+      `respuesta_breve solo se usa para preguntas que no resuelve la lógica de catálogo/compra. Español salvadoreño natural, breve y amable. No inventes productos, precios, disponibilidad, políticas, ni afirmes que un pedido ya está registrado. El envío es gratis; los productos DISPONIBLE son de entrega inmediata y TEST pueden requerir 3–5 días según el estado dado por la aplicación.`
+    const r = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
-      body: JSON.stringify({ model: 'gpt-4o-mini', temperature: 0.2, max_tokens: 150, messages }),
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        instructions,
+        input: JSON.stringify(contexto),
+        max_output_tokens: 300,
+        store: false,
+        text: {
+          format: {
+            type: 'json_schema', name: 'analisis_turno', strict: true,
+            schema: {
+              type: 'object', additionalProperties: false,
+              properties: {
+                intent: { type: 'string', enum: ['greeting','catalog','product_question','product_choice','purchase','provide_order_data','cancel','human','how_to_order','other'] },
+                sku: { type: 'string' },
+                nombre_cliente: { type: 'string' },
+                direccion: { type: 'string' },
+                metodo_pago: { type: 'string', enum: ['', 'efectivo', 'transferencia'] },
+                respuesta_breve: { type: 'string' },
+              },
+              required: ['intent','sku','nombre_cliente','direccion','metodo_pago','respuesta_breve'],
+            },
+          },
+        },
+      }),
       signal: ctrl.signal,
     })
-    if (!r.ok) return null
+    if (!r.ok) {
+      console.error('analizarTurno OpenAI', r.status, (await r.text().catch(() => '')).slice(0, 400))
+      return fallback
+    }
     const j = await r.json()
-    const txt = String(j?.choices?.[0]?.message?.content || '').trim()
-    return txt && !txt.startsWith('{') ? txt : null
-  } catch {
-    return null
+    const output = (j?.output || []).flatMap((item: any) => item?.content || []).find((c: any) => c?.type === 'output_text')?.text
+    if (!output) return fallback
+    const parsed = JSON.parse(String(output)) as AnalisisTurno
+    const validSkus = new Set(disp.map(p => p.sku))
+    if (parsed.sku && !validSkus.has(parsed.sku)) parsed.sku = ''
+    if (!['', 'efectivo', 'transferencia'].includes(parsed.metodo_pago)) parsed.metodo_pago = ''
+    if (!['greeting','catalog','product_question','product_choice','purchase','provide_order_data','cancel','human','how_to_order','other'].includes(parsed.intent)) parsed.intent = 'other'
+    parsed.nombre_cliente = String(parsed.nombre_cliente || '').trim().slice(0, 100)
+    parsed.direccion = String(parsed.direccion || '').trim().slice(0, 500)
+    parsed.respuesta_breve = String(parsed.respuesta_breve || '').trim().slice(0, 700)
+    return parsed
+  } catch (e) {
+    console.error('analizarTurno error', e instanceof Error ? e.message : e)
+    return fallback
   } finally {
-    clearTimeout(t)
+    clearTimeout(timeout)
   }
+}
+
+function hayCompraPendienteEnHistorial(hist: Conv[]): boolean {
+  const ultima = hist[hist.length - 1]
+  if (ultima && (esCancelar(ultima.entrada) || /sin problema.*cuando queras comprar|cancelamos|pedido cancelado/.test(norm(ultima.respuesta)))) return false
+  const compra = /\b(lo quiero|lo llevo|me lo llevo|mandame|mandeme|me lo manda|quiero comprar|quiero uno|apartar|pedido|encargar|de una|haganlo|hagale)\b/
+  const pideProducto = /(escribime.*producto|nombre del producto|cual producto|que producto.*comprar|producto que queres comprar|identificar cual producto|no hace falta volver a confirmar)/
+  return hist.slice(-4).some(h => compra.test(norm(h.entrada)) && pideProducto.test(norm(h.respuesta))) ||
+    hist.slice(-2).some(h => /ya entendi que queres comprar|seguimos directamente con tus datos/.test(norm(h.respuesta)))
 }
 
 // ============ MINI AGENTE ============
@@ -451,17 +570,65 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
     return `¡Hola! 👋 Soy *${AGENTE}* de TodoEnUno SV 💛\nEstoy actualizando el catálogo en este momento. ¿Querés que te pase con un asesor?\n👉 Responde: asesor`
   }
 
-  // ---- Recolección de datos del pedido ----
-  if (st.paso === 'recolectando' && st.last_sku) {
-    if (n === 'reintentar' && st.nombre_cliente && st.direccion && st.metodo_pago) {
-      // Continúa al guardado usando el estado ya persistido.
-    } else if (esCancelar(msg) || esListar(msg)) {
+  const analisis = await analizarTurno(msg, st, disp, hist)
+  const quiereComprar = esPedir(msg) || analisis.intent === 'purchase'
+  if (analisis.intent === 'human' && !esAsesor(msg)) {
+    st.paso = 'asesor'
+    await saveState(st)
+    return `Te paso con asesor 🙋‍♂️ Soy ${AGENTE} y dejo tu chat marcado para atención humana. ¡Gracias! 💛`
+  }
+
+  // Recupera la intención pendiente tanto desde el estado persistido como desde los últimos intercambios
+  // (esto repara chats que quedaron en 'info' por la versión anterior del webhook).
+  if (st.paso === 'info' && hayCompraPendienteEnHistorial(hist)) {
+    st.paso = 'esperando_producto_para_comprar'
+    await saveState(st)
+  }
+  if (st.paso === 'esperando_producto_para_comprar') {
+    if (esCancelar(msg) || analisis.intent === 'cancel') {
       st.paso = 'info'
       await saveState(st)
-      if (esListar(msg)) return `¡Mirá lo que tenemos! ✨\n\n${listar(disp)}\n\nEscribime el nombre del que te guste 😊`
+      return `Sin problema 😊 Cuando querás comprar algo, escribime y seguimos.`
+    }
+    if (esListar(msg) || analisis.intent === 'catalog') {
+      await saveState(st)
+      return `¡Claro! Estas son algunas opciones ✨\n\n${listar(disp)}\n\nDecime cuál querés comprar y seguimos con tu pedido 😊`
+    }
+    const skuPendiente = analisis.sku && disp.some(p => p.sku === analisis.sku) ? analisis.sku : ''
+    const prodPendiente = (skuPendiente ? disp.find(p => p.sku === skuPendiente) : null) || buscarProducto(msg, disp)
+    if (prodPendiente) {
+      st.last_sku = prodPendiente.sku
+      st.last_nombre = prodPendiente.nombre_completo
+      st.paso = 'recolectando'
+      await saveState(st)
+      return `¡Perfecto! 🎉 Ya tengo el producto: *${st.last_nombre}*. Seguimos con tu compra 😊\n\n${faltantes(st)}`
+    }
+    if (analisis.intent === 'other' && analisis.respuesta_breve) {
+      return `${analisis.respuesta_breve}\n\nY seguimos con tu compra: solo necesito que me digás qué producto querés 😊`
+    }
+    return `¡Sí, te ayudo a comprarlo! 😊 Escribime el nombre del producto o elegilo del catálogo y seguimos directamente con tus datos; no hace falta volver a confirmar que lo querés 💛\n\n${listar(disp, 5)}`
+  }
+
+  // ---- Recolección de datos del pedido ----
+  if (st.paso === 'recolectando' && st.last_sku) {
+    if (analisis.sku && analisis.sku !== st.last_sku && ['purchase', 'product_choice'].includes(analisis.intent)) {
+      const nuevo = disp.find(p => p.sku === analisis.sku)
+      if (nuevo) {
+        st.last_sku = nuevo.sku
+        st.last_nombre = nuevo.nombre_completo
+        await saveState(st)
+        return `Perfecto, cambiamos tu elección a *${nuevo.nombre_completo}* 😊\n\n${faltantes(st)}`
+      }
+    }
+    if (n === 'reintentar' && st.nombre_cliente && st.direccion && st.metodo_pago) {
+      // Continúa al guardado usando el estado ya persistido.
+    } else if (esCancelar(msg) || analisis.intent === 'cancel' || esListar(msg) || analisis.intent === 'catalog') {
+      st.paso = 'info'
+      await saveState(st)
+      if (esListar(msg) || analisis.intent === 'catalog') return `¡Mirá lo que tenemos! ✨\n\n${listar(disp)}\n\nEscribime el nombre del que te guste 😊`
       return `Sin problema 😊 Si querés ver algo más, escribí: catalogo`
     }
-    recolectar(st, msg)
+    recolectar(st, msg, analisis)
     if (st.nombre_cliente && st.direccion && st.metodo_pago) {
       const prod = disp.find((p) => p.sku === st.last_sku)
       if (!prod) {
@@ -496,11 +663,14 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
     return `¡Perfecto! Soy ${AGENTE} 😊 Solo me falta:\n\n${faltantes(st)}`
   }
 
-  if (st.paso === 'confirmado' && (esPedir(msg) || n === 'lo quiero' || n === 'lo_quiero')) {
-    return `Tu pedido anterior ya quedó registrado ✅💛 Si querés hacer otro, escribí *catálogo* y elegimos el siguiente producto.`
+  if (st.paso === 'confirmado' && quiereComprar && (!analisis.sku || analisis.sku === st.last_sku) && !buscarProducto(msg, disp)) {
+    return `Tu pedido anterior ya quedó registrado ✅💛 Si querés hacer otro, decime qué producto nuevo querés comprar o escribí *catálogo*.`
+  }
+  if (st.paso === 'confirmado' && (analisis.intent === 'product_choice' || (analisis.sku && analisis.sku !== st.last_sku))) {
+    st.paso = 'info'
   }
 
-  if (esSaludo(msg)) {
+  if (esSaludo(msg) || analisis.intent === 'greeting') {
     return `¡Hola! 👋 Soy *${AGENTE}* de TodoEnUno SV 💛\nTenemos *${disp.length}* productos disponibles en el catálogo 🛍️\n\n¿Qué te gustaría ver?\n👉 Responde: catálogo\n👉 Responde: asesor`
   }
 
@@ -514,7 +684,7 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
     }
   }
 
-  if (esComoPedir(msg)) {
+  if (esComoPedir(msg) || analisis.intent === 'how_to_order') {
     if (st.last_sku) {
       st.paso = 'recolectando'
       await saveState(st)
@@ -523,8 +693,9 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
     return `¡Fácil! Soy ${AGENTE} 😊 Elegí un producto, escribe *Lo quiero* y te pido nombre, dirección y forma de pago. Envío GRATIS 🚚\n\nEscribí: catalogo`
   }
 
-  if (esPedir(msg) || n === 'lo quiero' || n === 'lo_quiero') {
-    const prodMsg = buscarProducto(msg, disp) || productoDeUltimaRespuesta(hist, disp)
+  if (quiereComprar || n === 'lo quiero' || n === 'lo_quiero') {
+    const productoAnalizado = analisis.sku ? disp.find(p => p.sku === analisis.sku) || null : null
+    const prodMsg = productoAnalizado || buscarProducto(msg, disp) || (st.last_sku ? disp.find(p => p.sku === st.last_sku) || null : null) || productoDeUltimaRespuesta(hist, disp)
     if (prodMsg) {
       st.last_sku = prodMsg.sku
       st.last_nombre = prodMsg.nombre_completo
@@ -537,16 +708,19 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
       return `¡Excelente elección! 🎉 Te ayudo con *${st.last_nombre}*.\n\n${faltantes(st)}`
     }
     // Si se perdió el estado no inventar el producto ni caer en una respuesta genérica.
-    st.paso = 'info'
+    st.paso = 'esperando_producto_para_comprar'
     await saveState(st)
-    return `¡Con gusto! 😊 Para no equivocarme, escribime el nombre del producto que querés comprar o toca *Ver catálogo*. Así te preparo el pedido correcto 💛`
+    return `¡Con gusto! 😊 Ya entendí que querés comprar. Solo necesito identificar cuál producto: escribime su nombre o elegilo del catálogo y seguimos directamente con tus datos, sin volver a preguntarte si lo querés 💛\n\n${listar(disp, 5)}`
   }
 
-  if (esListar(msg)) {
+  if (esListar(msg) || analisis.intent === 'catalog') {
     return `¡Mirá lo que tenemos! ✨ Todo disponible 😊\n\n${listar(disp)}\n\nEscribime el nombre del que te guste, con talla y color si aplica 😊`
   }
 
-  const prod = buscarProducto(msg, disp)
+  const productoAnalizado = analisis.sku && ['product_question', 'product_choice'].includes(analisis.intent)
+    ? disp.find(p => p.sku === analisis.sku) || null
+    : null
+  const prod = productoAnalizado || buscarProducto(msg, disp)
   if (prod) {
     st.last_sku = prod.sku
     st.last_nombre = prod.nombre_completo
@@ -555,10 +729,24 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
     return fichaProducto(prod)
   }
 
-  const muestra = distintos(disp, 5).map((p) => `${p.nombre_completo} ${fmtPrecio(p.precioNum)}`).join('; ')
-  const ia = await openaiFallback(msg, hist, muestra)
-  if (ia) return ia
+  if (analisis.respuesta_breve && analisis.intent === 'other') return analisis.respuesta_breve
   return `¡Te ayudo con gusto! 😊 Puedo darte precio y detalles, mostrarte el catálogo o ayudarte a comprar. Escribí *catálogo* o mandame el nombre del producto 💛`
+}
+
+// ============ AGENTE DE COHERENCIA ============
+// Revisa el texto final contra el estado real. Es una defensa determinista contra bucles de compra.
+function protegerCoherencia(respuesta: string, st: Estado): string {
+  const r = norm(respuesta)
+  if (st.paso === 'recolectando' && /(que producto queres|nombre del producto|te lo aparto|responde lo quiero|si lo queres)/.test(r)) {
+    return `Ya tengo tu producto: *${st.last_nombre || 'el artículo elegido'}* 😊 No necesitás volver a elegirlo. Para completar la compra solo me falta:\n\n${faltantes(st)}`
+  }
+  if (st.paso === 'esperando_producto_para_comprar' && /(te lo aparto|responde lo quiero|confirmame si lo queres)/.test(r)) {
+    return `Ya entendí que querés comprar 😊 Solo necesito que me digás el nombre del producto. Después seguimos directamente con los datos del pedido.`
+  }
+  if (st.paso === 'confirmado' && /(escribime lo quiero|te lo aparto|confirmame si lo queres)/.test(r)) {
+    return `Tu pedido ya está registrado ✅💛 Si querés comprar otro artículo, decime cuál producto nuevo buscás.`
+  }
+  return respuesta
 }
 
 // ============ BUFFER ANTI-SPAM ============
@@ -608,12 +796,6 @@ export async function POST(req: NextRequest) {
     const jid: string = key.remoteJid || ''
     if (!jid || jid.indexOf('@g.us') !== -1 || jid.indexOf('status@broadcast') !== -1) return NextResponse.json({ ok: true })
 
-    if (key.id) {
-      if (vistos.has(key.id)) return NextResponse.json({ ok: true })
-      vistos.add(key.id)
-      if (vistos.size > 500) vistos.clear()
-    }
-
     let m = data?.message || {}
     // Evolution puede envolver mensajes de texto en ephemeral/view-once.
     for (let depth = 0; depth < 3; depth++) {
@@ -647,13 +829,34 @@ export async function POST(req: NextRequest) {
     const unido = await unirMensajes(tel, raw)
     if (unido === null) return NextResponse.json({ ok: true })
 
-    const [st, disp, hist] = await Promise.all([getState(tel), getDisponibles(), getHistory(tel)])
-    const texto = await miniAgente(tel, unido, st, disp, hist)
-    const botones = botonesPara(unido, texto)
+    // Serializa por teléfono a través de todas las instancias serverless, no solo por memoria local.
+    const lockToken = randomUUID()
+    const lockAdquirido = await adquirirBloqueoCliente(tel, lockToken)
+    if (!lockAdquirido) {
+      // No perder el mensaje si otra ejecución mantuvo el bloqueo demasiado tiempo.
+      const { error } = await supabase.from('whatsapp_buffer').insert({ telefono: tel, mensaje: unido })
+      if (error) console.error('buffer requeue after lock timeout', error.message)
+      return NextResponse.json({ ok: false, error: 'conversation_busy' }, { status: 503 })
+    }
 
-    await sendWhatsApp(number, texto, botones)
-    await saveConv(tel, unido, texto)
-    return NextResponse.json({ ok: true })
+    try {
+      // Mover el dedupe local dentro del bloqueo evita que dos ejecuciones calientes lean/escriban el mismo estado a la vez.
+      if (key.id) {
+        if (vistos.has(key.id)) return NextResponse.json({ ok: true })
+        vistos.add(key.id)
+        if (vistos.size > 500) vistos.clear()
+      }
+      const [st, disp, hist] = await Promise.all([getState(tel), getDisponibles(), getHistory(tel)])
+      const respuestaAgente = await miniAgente(tel, unido, st, disp, hist)
+      const texto = protegerCoherencia(respuestaAgente, st)
+      const botones = botonesPara(unido, texto)
+
+      await sendWhatsApp(number, texto, botones)
+      await saveConv(tel, unido, texto)
+      return NextResponse.json({ ok: true })
+    } finally {
+      await liberarBloqueoCliente(tel, lockToken)
+    }
   } catch (e: any) {
     console.error('webhook error', e)
     return NextResponse.json({ ok: true })
