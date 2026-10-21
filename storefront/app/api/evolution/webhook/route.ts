@@ -72,7 +72,49 @@ Envio GRATIS 1-3 dias habiles. Colores segun disponibilidad. Si no llegan a su z
 `;
 }
 // ==================== AGENTE 2: FIN ====================
+function buildSystemPrompt(vars: any[], state: any, nombre: string) {
+  const ahoraSV = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/El_Salvador' }));
+  const hora = ahoraSV.getHours();
+  const saludo = hora >= 5 && hora < 12 ? 'Buenos dias!' : hora >= 12 && hora < 18 ? 'Buenas tardes!' : 'Buenas noches!';
 
+  // FIX: Si ya hay producto en contexto, solo manda ESE producto, no los 91
+  let catalogoTexto = "";
+  let productoConfirmado = "";
+  if (state?.last_nombre) {
+    const prod = vars.find((v: any) => norm(v.nombre_completo).includes(norm(state.last_nombre)) || norm(state.last_nombre).includes(norm(v.nombre_completo)));
+    if (prod) {
+      productoConfirmado = `PRODUCTO CONFIRMADO: ${prod.nombre_completo} | SKU: ${prod.sku || prod.nombre_completo} | Precio: $${prod.precio || 15}`;
+      catalogoTexto = `${prod.sku} | ${prod.nombre_completo} | ${prod.precio || 15}`;
+    }
+  } else {
+    catalogoTexto = vars.slice(0, 20).map((v: any) => `${v.sku || 'SKU'} | ${v.nombre_completo} | ${v.precio || 15}`).join(' || ');
+  }
+
+  return `Eres Todd, vendedor de Todo en Uno por WhatsApp en El Salvador. Amable, directo y orientado a cerrar ventas. Envio GRATIS a todo El Salvador.
+CATALOGO: ${catalogoTexto}
+${productoConfirmado}
+NOMBRE WHATSAPP: ${nombre}
+SALUDO ACTUAL: ${saludo}
+
+=== REGLA 1: FORMATO ===
+Tu respuesta SIEMPRE es JSON valido:
+{"accion":"respuesta_simple o confirmar_pedido","sku":"${state?.last_nombre || 'PORTA BEBES'}","nombre_cliente":null,"direccion":null,"metodo_pago":null,"respuesta":"mensaje"}
+Usa | para saltos de linea.
+
+=== REGLA 2: PRODUCTO EN CONTEXTO - CRITICA ===
+${productoConfirmado ? `El producto ya esta CONFIRMADO: ${state.last_nombre}. Usa OBLIGATORIAMENTE ese mismo sku en TODAS tus respuestas. PROHIBIDO cambiarlo a otro producto como chancla, cangurera, etc. Solo cambias si el cliente dice explicitamente "no quiero ese, quiero X" ` : 'Identifica el producto del catalogo de forma semantica.'}
+
+=== REGLA 3: CONFIRMAR PEDIDO ===
+Cuando tengas sku + nombre_cliente + direccion + metodo_pago, usa accion=confirmar_pedido con respuesta="". NUNCA uses confirmar_pedido si falta un dato.
+
+=== REGLA 4: RECOLECTAR DATOS ===
+Pide: Nombre completo, Direccion completa (colonia, municipio, departamento, calle, referencia), Metodo de pago (efectivo o transferencia). Formato:
+"Para coordinar tu pedido necesito estos datos:||📝 Nombre completo:|📍 Dirección: (colonia, municipio, departamento, calle y punto de referencia)|💳 Método de pago: (efectivo o transferencia)"
+Si el cliente da varios datos, extraelos todos y pide solo lo que falte.
+`;
+}
+
+// ==================== AGENTE 3: PARSEAR RESPUESTA - INICIO ====================
 // ==================== AGENTE 3: PARSEAR RESPUESTA - INICIO ====================
 function parsearRespuestaIA(raw: string, skuFallback: string) {
   let parsed: any;
@@ -82,6 +124,16 @@ function parsearRespuestaIA(raw: string, skuFallback: string) {
   } catch {
     parsed = { accion: 'respuesta_simple', sku: skuFallback, nombre_cliente: null, direccion: null, metodo_pago: null, respuesta: raw };
   }
+
+  // FIX ANTI-CHANCLA: si ya hay producto confirmado, no dejar que el LLM cambie a otro
+  if (skuFallback && skuFallback.length > 3) {
+    // Solo permite cambio si el usuario dijo explicitamente otro producto
+    // Por ahora forzamos el fallback que es PORTA BEBES
+    if (!parsed.sku || parsed.sku.toLowerCase().includes('chancla') || parsed.sku.toLowerCase().includes('confort')) {
+      parsed.sku = skuFallback;
+    }
+  }
+
   if (!parsed.sku) parsed.sku = skuFallback;
 
   const tieneNombre = parsed.nombre_cliente && parsed.nombre_cliente.length > 2;
@@ -91,79 +143,17 @@ function parsearRespuestaIA(raw: string, skuFallback: string) {
 
   if (parsed.accion === 'confirmar_pedido' && (!tieneSku || !tieneNombre || !tieneDir || !tienePago)) {
     parsed.accion = 'respuesta_simple';
-    if (!tieneNombre) parsed.respuesta = "Para coordinar tu pedido necesito estos datos:||📝 Nombre completo:|📍 Dirección: (colonia, municipio, departamento, calle y punto de referencia)|💳 Método de pago: (efectivo o transferencia)";
+    if (!tieneNombre) {
+      parsed.respuesta = "Para coordinar tu pedido necesito estos datos:||📝 Nombre completo:|📍 Dirección: (colonia, municipio, departamento, calle y punto de referencia)|💳 Método de pago: (efectivo o transferencia)";
+    }
   }
+
   if (parsed.accion === 'respuesta_simple' && tieneNombre && tieneDir && tienePago && tieneSku) {
     parsed.accion = 'confirmar_pedido';
     parsed.respuesta = "";
   }
+
   return parsed;
 }
 // ==================== AGENTE 3: FIN ====================
-
-// ==================== AGENTE 4: LILI - INICIO ====================
-export async function GET() { return Response.json({ v: 'v24-todd-aae-fusion' }); }
-
-export async function POST(req: Request) {
-  const body = await req.json();
-  const d = body.data || body;
-  if (d.key?.fromMe) return Response.json({ ok: true });
-  const jid = d.key?.remoteJid || '';
-  const rawOriginal = (d.message?.conversation || d.message?.extendedTextMessage?.text || '').trim();
-  if (!rawOriginal || !jid) return Response.json({ ok: true });
-  const k = getKey(jid);
-  const mensaje = sanitizarInput(rawOriginal);
-  const nombre = d.pushName || 'Cliente';
-
-  const supa = createClient(process.env.SUPABASE_URL!, process.env.SUPABASE_SERVICE_KEY!);
-  const { data: vars } = await supa.from('productos_variantes').select('*').limit(3000);
-  let state = await getState(supa, k);
-  if (!state) state = { telefono: k };
-
-  const systemPrompt = buildSystemPrompt(vars || [], state, nombre);
-
-  const historial = await supa.from('whatsapp_conversations').select('entrada,respuesta').eq('telefono', k).order('created_at', { ascending: true }).limit(20);
-  const messages: any[] = [{ role: 'system', content: systemPrompt }];
-  if (historial.data) {
-    for (const h of historial.data) {
-      messages.push({ role: 'user', content: h.entrada });
-      messages.push({ role: 'assistant', content: h.respuesta });
-    }
-  }
-  messages.push({ role: 'user', content: mensaje });
-
-  const openaiRes = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ model: 'gpt-4o-mini', temperature: 0.4, messages })
-  });
-  const openaiJson = await openaiRes.json();
-  const content = openaiJson.choices?.[0]?.message?.content || '{"accion":"respuesta_simple","respuesta":"Hola! En que puedo ayudarte?"}';
-
-  const parsed = parsearRespuestaIA(content, state.last_nombre || 'PORTA BEBES');
-
-  let respFinal = (parsed.respuesta || '').replace(/\|/g, '\n');
-
-  if (parsed.accion === 'confirmar_pedido') {
-    await supa.from('whatsapp_orders').insert({
-      telefono: k, nombre: parsed.nombre_cliente, telefono_cliente: k,
-      departamento: 'San Salvador', municipio: 'San Salvador', direccion: parsed.direccion,
-      items: [{ nombre: parsed.sku }], total: 15, estado: 'nuevo', metodo_pago: parsed.metodo_pago
-    });
-    await saveState(supa, k, { paso: 'confirmado', nombre_cliente: parsed.nombre_cliente, direccion: parsed.direccion });
-    respFinal = `✅ PEDIDO CONFIRMADO\n🛍️ ${parsed.sku}\n👤 ${parsed.nombre_cliente}\n📍 ${parsed.direccion}\n💳 ${parsed.metodo_pago}\n\n🚚 Envio GRATIS 1-3 dias habiles`;
-  } else {
-    if (parsed.sku) await saveState(supa, k, { last_nombre: parsed.sku, last_precio: 15, paso: state.paso });
-    if (parsed.nombre_cliente) await saveState(supa, k, { nombre_cliente: parsed.nombre_cliente });
-    if (parsed.direccion) await saveState(supa, k, { direccion: parsed.direccion });
-  }
-
-  await supa.from('whatsapp_conversations').insert({ telefono: k, entrada: rawOriginal, respuesta: respFinal });
-  await fetch(`${process.env.EVOLUTION_API_URL}/message/sendText/${process.env.EVOLUTION_INSTANCE}`, {
-    method: 'POST', headers: { 'apikey': process.env.EVOLUTION_API_KEY!, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ number: jid, text: respFinal })
-  });
-
-  return Response.json({ ok: true, accion: parsed.accion });
-}
 // ==================== AGENTE 4: FIN ====================
