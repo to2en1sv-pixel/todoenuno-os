@@ -1,4 +1,3 @@
-
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
@@ -13,6 +12,9 @@ const EVO_KEY = process.env.EVOLUTION_API_KEY || ''
 const SB_URL_RAW = process.env.SUPABASE_URL || 'https://trgywmhxmkbjfcdvxpnz.supabase.co'
 const SB_URL = SB_URL_RAW.startsWith('http') ? SB_URL_RAW : `https://${SB_URL_RAW}.supabase.co`
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || ''
+
+console.log('ENV CHECK', { hasEvoUrl: !!EVO_URL, hasEvoKey: !!EVO_KEY, instance: EVO_INSTANCE, sbUrl: SB_URL, hasSbKey: !!SB_KEY, sbKeyPrefix: SB_KEY.slice(0,10) })
+
 const supabase = createClient(SB_URL, SB_KEY, { auth: { persistSession: false } })
 
 type Producto = { sku:string; nombre_completo:string; precio:number; talla:string|null; color:string|null; image_url:string|null; qty:number; state:string; precioNum:number }
@@ -22,16 +24,15 @@ const norm = (s:string)=> (s||'').toLowerCase().normalize('NFD').replace(/[\u030
 const getKey = (jid:string)=> (jid||'').replace(/\D/g,'').slice(-11)
 const cleanNumber = (jid:string)=> (jid||'').replace(/:\d+(?=@)/,'').split('@')[0].replace(/\D/g,'')
 const fmtPrecio = (p:number)=> `$${Number(p||0).toFixed(2).replace(/\.00$/,'')}`
-const estadoTxt = (p:Producto)=> p.state==='DISPONIBLE' && p.qty>0 ? '✅ Entrega inmediata' : '✨ Disponible bajo pedido 3-5 días'
+const estadoTxt = (p:Producto)=> p.state==='DISPONIBLE' && p.qty>0 ? '✅ Entrega inmediata' : '✨ Bajo pedido 3-5 días'
 
 function evoHeaders(){ return { 'Content-Type':'application/json', apikey:EVO_KEY, 'User-Agent':'axios/1.13.2' } }
 
 async function sendText(num:string,text:string){
-  console.log('SEND to',num,'len',text.length)
   try{
     const r=await fetch(`${EVO_URL}/message/sendText/${EVO_INSTANCE}`,{method:'POST',headers:evoHeaders(),body:JSON.stringify({number:num,text})})
     const b=await r.text().catch(()=> '')
-    console.log('sendText',r.status,b.slice(0,400))
+    console.log('sendText',r.status,b.slice(0,300))
     return r.ok
   }catch(e){ console.error('send err',e); return false }
 }
@@ -43,13 +44,39 @@ async function getState(tel:string): Promise<Estado>{
 async function saveState(st:Estado){ await supabase.from('whatsapp_state').upsert({...st,updated_at:new Date().toISOString()},{onConflict:'telefono'}) }
 async function saveConv(tel:string,e:string,r:string){ await supabase.from('whatsapp_conversations').insert({telefono:tel,entrada:e,respuesta:r}) }
 
-async function getDisponibles(): Promise<Producto[]>{
-  let allVars:any[]=[]; let from=0; const page=1000
-  for(;;){ const {data}=await supabase.from('productos_variantes').select('sku,nombre_completo,precio,talla,color,image_url').range(from,from+page-1); if(!data||data.length===0) break; allVars=allVars.concat(data); if(data.length<page) break; from+=page }
-  let allInv:any[]=[]; from=0
-  for(;;){ const {data}=await supabase.from('inventory_cache').select('sku,qty,state').range(from,from+page-1); if(!data||data.length===0) break; allInv=allInv.concat(data); if(data.length<page) break; from+=page }
+async function getDisponibles(): Promise<{productos:Producto[], debug:string}>{
+  let allVars:any[]=[]; let allInv:any[]=[]
+  let errVars=''; let errInv=''
+
+  try{
+    let from=0
+    for(;;){
+      const {data,error}=await supabase.from('productos_variantes').select('sku,nombre_completo,precio,talla,color,image_url').range(from,from+999)
+      if(error){ errVars=error.message; console.error('productos_variantes err',error.message); break }
+      if(!data||data.length===0) break
+      allVars=allVars.concat(data)
+      if(data.length<1000) break
+      from+=1000
+    }
+  }catch(e:any){ errVars=String(e?.message||e); console.error('productos_variantes catch',e) }
+
+  try{
+    let from=0
+    for(;;){
+      const {data,error}=await supabase.from('inventory_cache').select('sku,qty,state').range(from,from+999)
+      if(error){ errInv=error.message; console.error('inventory_cache err',error.message); break }
+      if(!data||data.length===0) break
+      allInv=allInv.concat(data)
+      if(data.length<1000) break
+      from+=1000
+    }
+  }catch(e:any){ errInv=String(e?.message||e); console.error('inventory_cache catch',e) }
+
+  console.log('SUPA DEBUG vars',allVars.length,'inv',allInv.length,'errVars',errVars,'errInv',errInv)
+
   const invMap=new Map<string,{qty:number,state:string}>()
   for(const i of allInv) invMap.set(i.sku,{qty:Number(i.qty)||0, state:String(i.state||'NO_DISPONIBLE').toUpperCase()})
+
   const out:Producto[]=[]
   for(const v of allVars){
     const state=invMap.get(v.sku)?.state || 'TEST'
@@ -59,22 +86,17 @@ async function getDisponibles(): Promise<Producto[]>{
     const precioNum=Number(String(v.precio||0).replace(/[,$\s]/g,''))||0
     out.push({...v, qty, state, precioNum, precio:precioNum})
   }
-  console.log('DISPONIBLES',out.length,'de',allVars.length)
-  return out
+
+  const debug=`vars:${allVars.length} inv:${allInv.length} filtrados:${out.length} errV:${errVars||'ok'} errI:${errInv||'ok'} sbKey:${SB_KEY ? 'set' : 'MISSING'}`
+  return { productos: out, debug }
 }
 
 function fichaProducto(p:Producto){
-  const l=[`🛍️ *${p.nombre_completo}*`,`💰 Precio: *${fmtPrecio(p.precioNum)}*`]
-  if(p.talla) l.push(`📏 Talla: ${p.talla}`)
-  if(p.color) l.push(`🎨 Color: ${p.color}`)
-  l.push(`📦 Estado: ${estadoTxt(p)}`)
-  l.push('','¿Te lo aparto? 😊','Responde: Lo quiero')
-  return l.join('\n')
+  return `🛍️ *${p.nombre_completo}*\n💰 Precio: *${fmtPrecio(p.precioNum)}*\n${p.talla?`📏 Talla: ${p.talla}\n`:''}${p.color?`🎨 Color: ${p.color}\n`:''}📦 Estado: ${estadoTxt(p)}\n\n¿Te lo aparto? Responde: Lo quiero`
 }
 
 const esSaludo = (m:string)=> /^(hola+|holi+|buenas?|buenos dias|buenas tardes|buenas noches|hey|ola|saludos|que tal)\b/.test(norm(m)) && norm(m).split(' ').length<=4
 const esListar = (m:string)=> /(que tienen|que tenes|que vende|catalogo|sobre que|que info|que productos|solo eso|solo de eso|ver mas|mas productos|que mas|que hay|lista|ver catalogo)/.test(norm(m))
-const esAsesor = (m:string)=> /(asesor|humano|persona real|agente|hablar con alguien|vendedor)/.test(norm(m))
 const esPedir = (m:string)=> /(lo quiero|lo llevo|mandeme|mandame|quiero uno|quiero comprar|comprar|pedir|pedido|ordenar|apartar|confirmar pedido)/.test(norm(m))
 const esDireccion = (m:string)=> /(colonia|escalon|san salvador|calle|avenida|pasaje|residencial|municipio|depto|departamento|km|casa|#|canton|caserio)/.test(norm(m)) || (/\d/.test(m) && m.length>12)
 
@@ -91,7 +113,6 @@ function detectaNombre(m:string): string|null{
   const words=t.split(/\s+/).filter(Boolean)
   if(words.length<2||words.length>4) return null
   if(!words.every(w=>/^[A-Za-zÁÉÍÓÚáéíóúÑñÜü'-]+$/.test(w))) return null
-  if(esSaludo(t)||esListar(t)||esPedir(t)||esAsesor(t)) return null
   return t.replace(/\b\w/g,c=>c.toUpperCase())
 }
 function buscarProducto(msg:string, disp:Producto[]): Producto|null{
@@ -108,37 +129,50 @@ function buscarProducto(msg:string, disp:Producto[]): Producto|null{
   for(const w of ord){ const s=w.length>4&&w.endsWith('s')?w.slice(0,-1):w; const h=disp.find(p=>norm(p.nombre_completo).includes(s)); if(h) return h }
   return null
 }
+function faltantes(st:Estado){ const f=[]; if(!st.nombre_cliente) f.push('📝 *Nombre completo:*'); if(!st.direccion) f.push('📍 *Dirección:*'); if(!st.metodo_pago) f.push('💳 *Pago:* efectivo/transferencia'); return f.join('\n') }
 
-function faltantes(st:Estado){ const f=[]; if(!st.nombre_cliente) f.push('📝 *Nombre completo:*'); if(!st.direccion) f.push('📍 *Dirección:* colonia, municipio, depto'); if(!st.metodo_pago) f.push('💳 *Pago:* efectivo/transferencia'); return f.join('\n') }
+async function miniAgente(tel:string, msg:string, st:Estado, disp:Producto[], debug:string){
+  if(/(asesor|humano|persona real)/.test(norm(msg))){ st.paso='asesor'; await saveState(st); return `Te paso con asesor 🙋‍♀️ En un momento te escribe una persona. 💛` }
 
-async function miniAgente(tel:string, msg:string, st:Estado, disp:Producto[]){
-  if(esAsesor(msg)){ st.paso='asesor'; await saveState(st); return `Te paso con asesor 🙋‍♀️ En un momento te escribe una persona de nuestro equipo. ¡Gracias! 💛` }
   if(st.paso==='recolectando' && st.last_sku){
     const pago=detectaPago(msg); if(pago) st.metodo_pago=pago
     else if(esDireccion(msg) && !st.direccion) st.direccion=msg.trim()
-    else { const nom=!st.nombre_cliente? detectaNombre(msg):null; if(nom) st.nombre_cliente=nom; else if(!st.direccion && msg.trim().length>12 && !esPedir(msg)) st.direccion=msg.trim() }
+    else { const nom=!st.nombre_cliente? detectaNombre(msg):null; if(nom) st.nombre_cliente=nom; else if(!st.direccion && msg.trim().length>12) st.direccion=msg.trim() }
     if(st.nombre_cliente && st.direccion && st.metodo_pago){
       const prod=disp.find(p=>p.sku===st.last_sku)
       const nombreProd=prod?.nombre_completo || st.last_nombre || 'Producto'
       const total=prod?.precioNum||0
       await supabase.from('whatsapp_orders').insert({ telefono:tel, nombre:st.nombre_cliente, telefono_cliente:tel, direccion:st.direccion, items:[{sku:st.last_sku,nombre:nombreProd,qty:1,precio:total}], total, estado:'nuevo', metodo_pago:st.metodo_pago })
       st.paso='confirmado'; await saveState(st)
-      return `✅ *PEDIDO CONFIRMADO* 🎉\n\n🛍 ${nombreProd}\n💰 Total: *${fmtPrecio(total)}*\n👤 ${st.nombre_cliente}\n📍 ${st.direccion}\n💳 ${st.metodo_pago}\n\n🚚 *Envío GRATIS 24-72h*\n¡Gracias! 💛`
+      return `✅ *PEDIDO CONFIRMADO* 🎉\n\n🛍 ${nombreProd}\n💰 Total: *${fmtPrecio(total)}*\n👤 ${st.nombre_cliente}\n📍 ${st.direccion}\n💳 ${st.metodo_pago}\n\n🚚 *Envío GRATIS 24-72h*`
     }
     await saveState(st)
     return `¡Perfecto! Solo me falta 😊\n\n${faltantes(st)}`
   }
-  if(esSaludo(msg)){ return `¡Hola! 👋 Soy *Lili* de TodoEnUno SV 💛\nTenemos *${disp.length}* productos disponibles con envío gratis 🚚\n\n¿Que te gustaría ver?\n👉 Responde: catalogo\n👉 Responde: asesor` }
-  if(esListar(msg)){ const lista=disp.slice(0,7).map(p=>`• *${p.nombre_completo}* - ${fmtPrecio(p.precioNum)}`).join('\n'); return `¡Mirá lo que tenemos! ✨\n\n${lista}\n\nEscribime el nombre del que te guste 😊` }
+
+  if(esSaludo(msg)){
+    if(disp.length===0) return `⚠️ DEBUG SUPA: ${debug}\n\nNo pude leer productos de Supabase. Revisá RLS de productos_variantes/inventory_cache y SUPABASE_SERVICE_KEY en Vercel.`
+    return `¡Hola! 👋 Soy *Lili* de TodoEnUno SV 💛\nTenemos *${disp.length}* productos con envío gratis 🚚\n\nResponde: catalogo`
+  }
+
+  if(esListar(msg)){
+    if(disp.length===0) return `⚠️ DEBUG SUPA: ${debug}\n\nCatálogo vacío - no lee Supabase.`
+    const lista=disp.slice(0,7).map(p=>`• *${p.nombre_completo}* - ${fmtPrecio(p.precioNum)}`).join('\n')
+    return `¡Mirá lo que tenemos! ✨\n\n${lista}\n\nEscribime el nombre del que te guste 😊`
+  }
+
   if(esPedir(msg) || norm(msg)==='lo quiero'){
     const prodMsg=buscarProducto(msg,disp)
     if(prodMsg){ st.last_sku=prodMsg.sku; st.last_nombre=prodMsg.nombre_completo }
     if(st.last_sku){ st.paso='recolectando'; await saveState(st); return `¡Excelente elección! 🎉 *${st.last_nombre}*\n\n${faltantes(st)}` }
   }
+
   const prod=buscarProducto(msg,disp)
   if(prod){ st.last_sku=prod.sku; st.last_nombre=prod.nombre_completo; st.paso='info'; await saveState(st); return fichaProducto(prod) }
+
+  if(disp.length===0) return `⚠️ DEBUG SUPA: ${debug}\n\nNo encuentro "${msg}" porque no hay productos cargados.`
   const lista=disp.slice(0,7).map(p=>`• *${p.nombre_completo}* - ${fmtPrecio(p.precioNum)}`).join('\n')
-  return `Esa no la tengo a mano, pero mirá lo que sí tenemos 💛\n\n${lista}\n\nEscribí el nombre, por ejemplo: porta bebe`
+  return `Esa no la tengo a mano, pero mirá lo que sí tenemos 💛\n\n${lista}`
 }
 
 export async function POST(req: NextRequest){
@@ -150,19 +184,20 @@ export async function POST(req: NextRequest){
     const jid=key.remoteJid||''
     if(!jid || jid.includes('@g.us')) return NextResponse.json({ok:true})
     const m=data?.message||{}
-    const raw=(m.conversation||m.extendedTextMessage?.text||m.imageMessage?.caption||m.buttonsResponseMessage?.selectedButtonId||m.buttonsResponseMessage?.selectedDisplayText||'').trim()
+    const raw=(m.conversation||m.extendedTextMessage?.text||m.imageMessage?.caption||'').trim()
     if(!raw) return NextResponse.json({ok:true})
+
     const tel=getKey(jid)
     const number=cleanNumber(jid)
 
-    const [st,disp]=await Promise.all([getState(tel), getDisponibles()])
-    const texto=await miniAgente(tel, raw, st, disp)
+    const [st, {productos, debug}]=await Promise.all([getState(tel), getDisponibles()])
 
+    const texto=await miniAgente(tel, raw, st, productos, debug)
     await sendText(number, texto)
     await saveConv(tel, raw, texto)
 
-    return NextResponse.json({ok:true})
+    return NextResponse.json({ok:true, debug})
   }catch(e:any){ console.error('fatal',e); return NextResponse.json({ok:true}) }
 }
 
-export async function GET(){ return NextResponse.json({ ok:true, service:'v44-text-only-final', instance:EVO_INSTANCE }) }
+export async function GET(){ return NextResponse.json({ ok:true, service:'v47-supa-debug', instance:EVO_INSTANCE }) }
