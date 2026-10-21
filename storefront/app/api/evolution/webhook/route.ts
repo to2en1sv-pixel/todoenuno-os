@@ -32,45 +32,52 @@ function classifyIntent(raw:string, state:any){
 }
 // ==================== AGENTE 1: FIN ====================
 
-// ==================== AGENTE 1.5: DISTINGUE PERSONA vs PRODUCTO vs DIRECCION - INICIO ====================
-function distinguirEntidad(raw:string, paso:string){
-  if(!paso) return 'PRODUCTO';
-  const p=paso.replace('collecting_','');
-  if(p==='nombre') return 'PERSONA'; // TODO lo que venga aqui es nombre, no buscar
-  if(p==='direccion') return 'DIRECCION'; // TODO es direccion
-  if(p==='municipio') return 'MUNICIPIO';
-  if(p==='telefono') return 'TELEFONO';
-  if(p==='departamento') return 'DEPARTAMENTO';
-  return 'PRODUCTO';
+// ==================== AGENTE 1.5: LISTA BLANCA DE PRODUCTOS - INICIO ====================
+function esProductoReal(raw:string, vars:any[]){
+  const n = norm(raw);
+  // solo si el mensaje contiene alguna palabra de tus productos
+  const keywords = vars.map(v=> norm(v.nombre_completo).split(' ').slice(0,2).join(' ')); // ej "porta bebe", "urinario rana", "cangurera urbana"
+  return keywords.some(k => n.includes(k) || k.includes(n) && n.length>4);
 }
-function validarSegunEntidad(entidad:string, valor:string){
-  const t=valor.trim();
-  if(entidad==='PERSONA'){
-    // Pasa TODO, hasta 1 palabra, con ñ, tildes, lo que sea
-    if(t.length<2) return {ok:false, msg:'❌ Dame tu nombre Ej: Carlos'};
-    return {ok:true, val:t};
-  }
-  if(entidad==='DIRECCION'){
-    if(t.length<8) return {ok:false, msg:'❌ Dirección corta Ej: Colonia Escalón #12 frente a farmacia'};
-    return {ok:true, val:t};
-  }
-  if(entidad==='MUNICIPIO'){
-    if(t.length<3) return {ok:false, msg:'❌ Municipio corto Ej: Soyapango'};
-    return {ok:true, val:t};
-  }
-  if(entidad==='TELEFONO'){
-    const num=t.replace(/\D/g,'').slice(-8);
-    if(num.length!==8) return {ok:false, msg:'❌ 8 dígitos Ej: 77974768'};
-    return {ok:true, val:num};
-  }
-  if(entidad==='DEPARTAMENTO'){
-    const f=DEPTOS.find(d=>norm(d).includes(norm(t)) || norm(t).includes(norm(d)));
-    if(!f) return {ok:false, msg:`❌ Depto: ${DEPTOS.join(', ')}`};
-    return {ok:true, val:f};
-  }
-  return {ok:true, val:t};
+
+function classifyIntent(raw:string, state:any, vars:any[]){
+  // FIX PRINCIPAL: si está recolectando, NUNCA es búsqueda
+  if(state?.paso?.startsWith('collecting_')) return 'colectando';
+  const n = norm(raw);
+  if(/lo quiero|apartalo/i.test(n)) return 'comprar';
+  // Solo es buscar si realmente menciona un producto de la lista blanca
+  if(esProductoReal(raw, vars)) return 'buscar';
+  return 'charla'; // asistente de ventas, no consultor de BD
 }
 // ==================== AGENTE 1.5: FIN ====================
+
+// En el POST reemplaza la lógica final por esto:
+let state = await getState(supa, k);
+let intent = classifyIntent(raw, state, vars||[]);
+let prod = null;
+
+if(intent==='colectando'){
+  const campo = state.paso.replace('collecting_','');
+  const entidad = campo==='nombre'?'PERSONA':campo==='direccion'?'DIRECCION':campo.toUpperCase();
+  const v = validarSegunEntidad(entidad, raw);
+  if(!v.ok) resp=v.msg;
+  else{
+    const col=campo==='nombre'?'nombre_cliente':campo==='telefono'?'telefono_cliente':campo;
+    await saveState(supa,k,{[col]:v.val});
+    resp=await pedirSiguiente(supa,k);
+  }
+}else if(intent==='comprar'){
+  // ... igual
+}else if(intent==='buscar'){
+  prod=await searchOS(vars||[], raw);
+  if(prod){
+    await saveState(supa,k,{last_nombre:prod.nombre_completo,last_precio:prod.precio||15});
+    resp=formatLILI(prod);
+  }
+}else{
+  // intent charla = asistente de ventas, no vuelve al saludo
+  resp=`Perfecto ${state?.nombre_cliente||''} 👌 seguimos con tu pedido de *${state?.last_nombre||'PORTA BEBES'}*.\n${await pedirSiguiente(supa,k)}`;
+}
 
 // ==================== AGENTE 2: BUSCADOR - INICIO ====================
 async function searchOS(vars:any[], raw:string){
