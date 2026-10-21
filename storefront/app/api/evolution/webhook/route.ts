@@ -16,6 +16,7 @@ const EVO_KEY = process.env.EVOLUTION_API_KEY || ''
 const OPENAI_KEY = process.env.OPENAI_API_KEY || ''
 const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-6-luna'
 const OPENAI_ANALYSIS_TIMEOUT_MS = 5000
+const BUILD_VERSION = process.env.VERCEL_GIT_COMMIT_SHA || process.env.GITHUB_SHA || 'local-unversioned'
 
 const SB_URL_RAW = process.env.SUPABASE_URL || 'https://trgywmhxmkbjfcdvxpnz.supabase.co'
 const SB_URL = SB_URL_RAW.startsWith('http') ? SB_URL_RAW : `https://${SB_URL_RAW}.supabase.co`
@@ -41,14 +42,15 @@ type Estado = {
   paso: string | null
   last_nombre: string | null
   last_sku: string | null
+  pedido_codigo_pendiente: string | null
 }
-type Conv = { entrada: string; respuesta: string }
+type Conv = { entrada: string; respuesta: string; created_at?: string; source?: 'conversation' | 'outbound' }
 type AnalisisTurno = {
   intent: 'greeting' | 'catalog' | 'product_question' | 'product_choice' | 'purchase' | 'provide_order_data' | 'cancel' | 'human' | 'how_to_order' | 'other'
   sku: string
   nombre_cliente: string
   direccion: string
-  metodo_pago: '' | 'efectivo' | 'transferencia'
+  metodo_pago: '' | 'efectivo' | 'transferencia' | 'wompi' | 'bitcoin' | 'puntos_banco_agricola' | 'cuotas_agricola'
   respuesta_breve: string
 }
 const ANALISIS_VACIO: AnalisisTurno = {
@@ -131,7 +133,7 @@ function botonesPara(msg: string, respuesta: string): string[] {
 // ============ MEMORIA ============
 async function getState(tel: string): Promise<Estado> {
   const { data, error } = await supabase.from('whatsapp_state').select('*').eq('telefono', tel).maybeSingle()
-  if (error) console.error('getState', error.message, 'telefono:', tel)
+  if (error) console.error('getState', error.message)
   return (
     (data as Estado) || {
       telefono: tel,
@@ -141,10 +143,11 @@ async function getState(tel: string): Promise<Estado> {
       paso: null,
       last_nombre: null,
       last_sku: null,
+      pedido_codigo_pendiente: null,
     }
   )
 }
-async function saveState(st: Estado) {
+async function saveState(st: Estado): Promise<boolean> {
   const base: any = {
     telefono: st.telefono,
     nombre_cliente: st.nombre_cliente,
@@ -153,26 +156,73 @@ async function saveState(st: Estado) {
     paso: st.paso,
     last_nombre: st.last_nombre,
     last_sku: st.last_sku,
+    pedido_codigo_pendiente: st.pedido_codigo_pendiente || null,
   }
   let r = await supabase.from('whatsapp_state').upsert({ ...base, updated_at: new Date().toISOString() }, { onConflict: 'telefono' })
   if (r.error) {
-    // la tabla puede no tener updated_at
+    // Algunas instalaciones antiguas no tienen updated_at.
     r = await supabase.from('whatsapp_state').upsert(base, { onConflict: 'telefono' })
-    if (r.error) console.error('saveState', r.error.message)
+    if (r.error) {
+      console.error('saveState', r.error.message)
+      return false
+    }
   }
+  return true
 }
+
 async function saveConv(tel: string, entrada: string, respuesta: string) {
   const { error } = await supabase.from('whatsapp_conversations').insert({ telefono: tel, entrada, respuesta })
   if (error) console.error('saveConv', error.message)
 }
+
+let outboundMemoryUnavailableWarned = false
 async function getHistory(tel: string): Promise<Conv[]> {
-  const { data } = await supabase
-    .from('whatsapp_conversations')
-    .select('entrada,respuesta')
-    .eq('telefono', tel)
-    .order('created_at', { ascending: false })
-    .limit(12)
-  return ((data as Conv[]) || []).reverse()
+  const [convResult, outboundResult] = await Promise.all([
+    supabase
+      .from('whatsapp_conversations')
+      .select('entrada,respuesta,created_at')
+      .eq('telefono', tel)
+      .order('created_at', { ascending: false })
+      .limit(16),
+    supabase
+      .from('whatsapp_outbound_memory')
+      .select('texto,created_at')
+      .eq('telefono', tel)
+      .order('created_at', { ascending: false })
+      .limit(24),
+  ])
+  if (convResult.error) console.error('getHistory', convResult.error.message)
+  if (outboundResult.error && !outboundMemoryUnavailableWarned) {
+    outboundMemoryUnavailableWarned = true
+    console.warn('Outbound history table unavailable; run supabase_whatsapp_lock.sql to synchronize sent messages')
+  }
+
+  const conversations: Conv[] = ((convResult.data as any[]) || []).map(row => ({
+    entrada: String(row.entrada || ''),
+    respuesta: String(row.respuesta || ''),
+    created_at: String(row.created_at || ''),
+    source: 'conversation' as const,
+  }))
+  const outbound: Conv[] = ((outboundResult.data as any[]) || []).map(row => ({
+    entrada: '',
+    respuesta: String(row.texto || ''),
+    created_at: String(row.created_at || ''),
+    source: 'outbound' as const,
+  })).filter(row => row.respuesta.trim())
+
+  // SEND_MESSAGE también puede reflejar una respuesta que este webhook ya guardó como turno.
+  // Se elimina la copia si texto y hora coinciden aproximadamente, sin perder mensajes de BuilderBot
+  // u otro emisor que todavía no aparecen en whatsapp_conversations.
+  const outboundSinDuplicados = outbound.filter(out => !conversations.some(conv => {
+    if (norm(conv.respuesta) !== norm(out.respuesta)) return false
+    const a = Date.parse(conv.created_at || '')
+    const b = Date.parse(out.created_at || '')
+    return Number.isFinite(a) && Number.isFinite(b) && Math.abs(a - b) <= 45000
+  }))
+
+  return [...conversations, ...outboundSinDuplicados]
+    .sort((a, b) => Date.parse(a.created_at || '') - Date.parse(b.created_at || ''))
+    .slice(-20)
 }
 
 // ============ BLOQUEO POR CLIENTE (Supabase/Postgres) ============
@@ -296,9 +346,11 @@ function distintos(disp: Producto[], n: number): Producto[] {
 
 function fichaProducto(p: Producto) {
   const l = [`🛍️ *${p.nombre_completo}*`, `💰 Precio: *${fmtPrecio(p.precioNum)}*`]
-  if (p.talla) l.push(`📏 Talla: *${p.talla}*`)
-  if (p.color) l.push(`🎨 Color: *${p.color}*`)
-  l.push(`📦 ${estadoTxt(p)}`, '', '¿Te lo aparto? 😊 Responde: Lo quiero')
+  // No llenar la respuesta con variantes genéricas como "Talla Única / Color Única".
+  // Las variantes solo se guardan si el cliente las menciona espontáneamente.
+  if (p.talla && norm(p.talla) !== 'unica') l.push(`📏 Talla: *${p.talla}*`)
+  if (p.color && norm(p.color) !== 'unica') l.push(`🎨 Color: *${p.color}*`)
+  l.push(`📦 ${estadoTxt(p)}`, '', '¿Te lo aparto? 😊 Podés decirme "sí, lo quiero", "me lo llevo" o expresarlo como prefirás.')
   return l.join('\n')
 }
 
@@ -352,15 +404,63 @@ function buscarProducto(msg: string, disp: Producto[]): Producto | null {
 }
 
 function productoDeUltimaRespuesta(hist: Conv[], disp: Producto[]): Producto | null {
-  // Recupera la última ficha individual sin depender del texto exacto de la pregunta de venta.
-  // Se exige encabezado al principio para no confundir un catálogo con una selección.
-  for (let i = hist.length - 1; i >= Math.max(0, hist.length - 4); i--) {
-    const last = String(hist[i]?.respuesta || '').trim()
-    const match = last.match(/^🛍️\s*\*([^*]+)\*/i)
-    if (!match?.[1]) continue
-    const nombre = norm(match[1])
-    const found = disp.find(p => norm(p.nombre_completo) === nombre)
-    if (found) return found
+  // Recupera el contexto de varios turnos/eventos recientes, incluso si Evolution informó una salida por separado. Esto repara el bucle antiguo:
+  // ficha -> "sí, lo quiero" -> bot vuelve a pedir el nombre -> cliente repite el nombre.
+  const inicio = Math.max(0, hist.length - 10)
+  for (let i = hist.length - 1; i >= inicio; i--) {
+    const turno = hist[i]
+    const entrada = String(turno?.entrada || '').trim()
+    const entradaNorm = norm(entrada)
+    if (/^(catalogo|ver catalogo|ver mas|mas productos|muestrame opciones|que productos tienen|que mas tienen)$/.test(entradaNorm) ||
+        esCancelar(entrada) || /(otro producto|algo diferente|busco otro|producto distinto|mejor otro)/.test(entradaNorm)) return null
+
+    const respuesta = String(turno?.respuesta || '').trim()
+    if (respuesta) {
+      const normResp = norm(respuesta)
+      // No inferir un producto desde un listado ni desde el resumen de una compra ya registrada.
+      if (/^(mira lo que tenemos|estas son algunas opciones|catalogo|productos disponibles)/.test(normResp) || /(pedido registrado|pedido confirmado|id de pedido|codigo de registro|tu pedido anterior ya quedo registrado)/.test(normResp)) return null
+
+      const candidatos: string[] = []
+      // Ficha individual con o sin Markdown: "🛍️ *PORTA BEBES*" / "🛍️ PORTA BEBES".
+      for (const rawLine of respuesta.split(/\r?\n/).slice(0, 5)) {
+        if (/^\s*[•●▪-]\s*/.test(rawLine)) continue
+        let header = rawLine.trim().replace(/^(?:🛍️?|🛒|📦)\s*/u, '')
+        header = header.replace(/^\*+|\*+$/g, '').trim()
+        if (!header || header.length > 120) continue
+        if (/^(precio|talla|color|disponibilidad|entrega|total|opciones|mira lo que tenemos|te comparto)/i.test(norm(header))) continue
+        if (rawLine.includes('🛍') || /\*|precio|talla|color/i.test(respuesta.slice(0, 240))) candidatos.push(header)
+      }
+      // Frases de continuidad que ya mencionaron el SKU/nombre del artículo.
+      const embebidos = [
+        /ya tengo el producto\s*:\s*\*?([^*\n.]+)\*?/i,
+        /te ayudo con\s+\*([^*]+)\*/i,
+        /cambiamos tu eleccion a\s+\*([^*]+)\*/i,
+        /producto seleccionado\s*:\s*\*?([^*\n.]+)\*?/i,
+      ]
+      for (const re of embebidos) {
+        const match = respuesta.match(re)
+        if (match?.[1]) candidatos.push(match[1].trim())
+      }
+      for (const candidato of candidatos) {
+        const nombre = norm(candidato)
+        const exacto = disp.find(p => norm(p.nombre_completo) === nombre)
+        if (exacto) return exacto
+        if (nombre.length >= 8) {
+          const matches = disp.filter(p => {
+            const pn = norm(p.nombre_completo)
+            return pn.startsWith(nombre) || nombre.startsWith(pn)
+          }).sort((a, b) => norm(b.nombre_completo).length - norm(a.nombre_completo).length)
+          if (matches.length) return matches[0]
+        }
+      }
+    }
+
+    // Si el cliente escribió el nombre explícitamente en uno de esos turnos, conservarlo aunque
+    // una respuesta antigua del bot no haya tenido ficha estructurada.
+    if (entrada && !esAceptacionCorta(entrada) && !esPedir(entrada)) {
+      const productoMencionado = buscarProducto(entrada, disp)
+      if (productoMencionado) return productoMencionado
+    }
   }
   return null
 }
@@ -381,25 +481,50 @@ const esSaludo = (m: string) => {
 const esListar = (m: string) =>
   /(que tienen|que tenes|que vende|catalogo|sobre que|que info|que productos|solo eso|solo de eso|ver mas|mas productos|que mas|que hay|lista|muestrame opciones)/.test(norm(m))
 const esAsesor = (m: string) => /(asesor|humano|persona real|agente|hablar con alguien|vendedor|atencion al cliente)/.test(norm(m))
+const esPostventa = (m: string) => /(pedido retrasado|pedido demorado|se retraso el pedido|no me ha llegado|no ha llegado|no me llega|donde esta mi pedido|seguimiento de mi pedido|reclamo|devolucion|devoluciones|cambio de pedido|cambiar mi pedido|problema con mi pedido)/.test(norm(m))
 const esPedir = (m: string) =>
   /(lo quiero|lo llevo|mandeme|mandame|me lo manda|quiero uno|quiero comprar|comprar|pedir|pedido|ordenar|lo_quiero|apartar|confirmar pedido)/.test(norm(m))
+const esAceptacionCorta = (m: string) => {
+  const n = norm(m).replace(/\s+/g, ' ').trim()
+  if (/^(si(?: claro| pues)?|sii+|simon|claro|dale(?: pues)?|va|de una(?: vez)?|hagale(?: pues)?|hacele(?: pues)?|ok(?:ay)?|listo|bueno(?: pues)?|perfecto|adelante|me interesa|correcto|ajale|pues si|si quiero|pues dale|confirmo|apartenmelo|apartamelo|me lo quedo|si lo quiero|sii lo quiero|si lo qiero|yo lo quiero|lo quiero|lo qiero|lo llevo|me lo llevo|mandamelo(?: porfa)?|mandemelo|si mandamelo|si mandame|si me lo manda|si porfa|dale porfa|mande|mandalo|hagamelo|me lo quedo|apartamelo|apartenmelo|quiero comprarlo|quiero ese|quiero esa|quiero el|quiero la|si quiero ese|si quiero esa|ese mismo|esa misma)$/.test(n)) return true
+  // Captura afirmaciones breves con pequeñas variaciones y errores comunes sin aceptar frases arbitrarias.
+  return /^(si|sii+|simon|claro|dale|va|ok|listo|hagale|de una) (yo )?(lo quiero|lo qiero|lo llevo|me lo llevo|mandamelo|mande melo|quiero ese|quiero esa|me interesa|lo compro|me lo quedo)$/.test(n)
+}
 const esComoPedir = (m: string) => /(como (hago|pido|compro|se hace).*(pedido|pedir|comprar)|como lo pido)/.test(norm(m))
 const esTallaColor = (m: string) =>
   /(que talla|que tallas|tienen talla|talla s\b|talla m\b|talla l\b|talla xl|que color|que colores|tienen colores|color rojo|color azul|color negro)/.test(norm(m))
 const esCancelar = (m: string) => /(cancelar|cancela|mejor no|ya no quiero)/.test(norm(m))
-const esDireccion = (m: string) =>
-  /\b(colonia|col|escalon|san salvador|calle|avenida|av|pasaje|residencial|municipio|depto|departamento|santa tecla|soyapango|mejicanos|apopa|ilopango|canton|caserio|lotificacion|urbanizacion|reparto|bloque|poligono|km|casa)\b/.test(norm(m)) ||
-  m.includes('#') ||
-  (/\d/.test(m) && m.length > 12)
-
-function detectaPago(m: string): string | null {
+const esDireccion = (m: string) => {
   const n = norm(m)
-  if (/efectivo|contra entrega|contraentrega|cash/.test(n)) return 'efectivo'
-  if (/transfer|deposito|banco/.test(n)) return 'transferencia'
+  return /\b(colonia|col|escalon|san salvador|santa ana|san miguel|sonsonate|la libertad|calle|avenida|av|pasaje|residencial|municipio|depto|departamento|santa tecla|soyapango|mejicanos|apopa|ilopango|canton|caserio|lotificacion|urbanizacion|reparto|bloque|poligono|km|casa|punto de encuentro|parque|alcaldia|centro comercial|metrocentro|multiplaza|plaza mundo|la gran via|galerias)\b/.test(n) ||
+    m.includes('#')
+}
+
+type MetodoPago = 'efectivo' | 'transferencia' | 'wompi' | 'bitcoin' | 'puntos_banco_agricola' | 'cuotas_agricola'
+function detectaPago(m: string): MetodoPago | null {
+  const n = norm(m)
+  if (/puntos? (de )?banco agricola|puntos agricola/.test(n)) return 'puntos_banco_agricola'
+  if (/cuotas|3 meses|tasa cero|tarjeta agricola/.test(n)) return 'cuotas_agricola'
+  if (/wompi|tarjeta debit|tarjeta credit|tarjeta de credito|tarjeta de debito/.test(n)) return 'wompi'
+  if (/bitcoin|\bbtc\b/.test(n)) return 'bitcoin'
+  if (/efectivo|contra entrega|contraentrega|cash|pagar al recibir|cuando llegue|al recibir/.test(n)) return 'efectivo'
+  if (/transfer|deposito|por banco/.test(n)) return 'transferencia'
   return null
 }
+function etiquetaPago(m: string | null | undefined): string {
+  const labels: Record<string, string> = {
+    efectivo: 'Efectivo contra entrega',
+    transferencia: 'Transferencia bancaria',
+    wompi: 'Tarjeta débito/crédito (Wompi)',
+    bitcoin: 'Bitcoin',
+    puntos_banco_agricola: 'Puntos Banco Agrícola',
+    cuotas_agricola: 'Cuotas con tarjeta de crédito Agrícola',
+  }
+  return labels[String(m || '')] || String(m || 'Pendiente de definir')
+}
 function detectaNombre(m: string): string | null {
-  const t = m.trim()
+  let t = m.trim().replace(/^(?:mi nombre es|me llamo|soy|nombre)\s*[:,-]?\s+/i, '')
+  t = t.replace(/[.!]+$/, '').trim()
   if (esDireccion(t) || detectaPago(t)) return null
   if (/[@\d\/:?!]/.test(t)) return null
   const words = t.split(/\s+/).filter(Boolean)
@@ -409,49 +534,107 @@ function detectaNombre(m: string): string | null {
   return t.replace(/\b\w/g, (c) => c.toUpperCase())
 }
 
-function faltantes(st: Estado) {
+function direccionSuficiente(valor: string | null | undefined): boolean {
+  const original = String(valor || '').trim()
+  const n = norm(original)
+  if (!n) return false
+  // Un punto de encuentro explícito es suficiente aunque no tenga número de casa.
+  if (/\b(punto de encuentro|parque|alcaldia|centro comercial|metrocentro|multiplaza|plaza mundo|gran via|galerias|plaza masferrer|parque central)\b/.test(n)) return true
+  const marcador = /\b(colonia|calle|avenida|av|pasaje|residencial|reparto|urbanizacion|lotificacion|canton|caserio|bloque|poligono|km|casa|bulevar|boulevard|zona)\b/.test(n)
+  const palabras = n.split(' ').filter(Boolean)
+  return /\d/.test(original) && original.length >= 8 || (marcador && palabras.length >= 4)
+}
+
+function faltantes(st: Estado): string[] {
   const f: string[] = []
-  if (!st.nombre_cliente) f.push('📝 *Nombre completo:*')
-  if (!st.direccion) f.push('📍 *Dirección:* colonia, municipio, depto')
-  if (!st.metodo_pago) f.push('💳 *Pago:* efectivo/transferencia')
-  return f.join('\n')
+  if (!st.nombre_cliente) f.push('nombre completo')
+  if (!direccionSuficiente(st.direccion)) f.push('dirección completa o punto de encuentro')
+  if (!st.metodo_pago) f.push('forma de pago')
+  return f
+}
+
+function preguntarDatos(st: Estado): string {
+  const faltan = faltantes(st)
+  if (!faltan.length) return '¡Gracias! Ya tengo los datos para registrar tu pedido 😊'
+  const saludo = st.nombre_cliente ? `Gracias, ${st.nombre_cliente} 😊. ` : '¡Perfecto! 😊 '
+  const opcionesPago = 'Podés pagar en efectivo al recibir, por transferencia bancaria, con tarjeta mediante Wompi, Bitcoin, Puntos Banco Agrícola o cuotas con tarjeta de crédito Agrícola.'
+  if (faltan.length === 3) return `${saludo}para dejar tu pedido listo, contame tu nombre completo, dónde preferís recibirlo (dirección o punto de encuentro) y cómo querés pagar. ${opcionesPago}`
+  if (faltan.includes('nombre completo') && faltan.includes('dirección completa o punto de encuentro')) return `${saludo}solo me falta tu nombre completo y dónde preferís recibirlo: podés darme la dirección o un punto de encuentro. La forma de pago ya quedó anotada 💛`
+  if (faltan.includes('nombre completo') && faltan.includes('forma de pago')) return `${saludo}¿me compartís tu nombre completo y cómo preferís pagar? ${opcionesPago} 💛`
+  if (faltan.includes('dirección completa o punto de encuentro') && faltan.includes('forma de pago')) return `${saludo}solo me falta saber dónde preferís recibirlo (dirección completa o punto de encuentro) y cómo querés pagar. ${opcionesPago} 💛`
+  if (faltan[0] === 'nombre completo') return `${saludo}¿me decís tu nombre completo para registrar el pedido? 😊`
+  if (faltan[0] === 'dirección completa o punto de encuentro') return `${saludo}¿dónde preferís recibirlo? Podés mandarme la dirección completa o decirme qué punto de encuentro te queda bien 😊`
+  return `${saludo}¿cómo preferís pagar: efectivo contra entrega, transferencia, tarjeta vía Wompi, Bitcoin, Puntos Banco Agrícola o cuotas Agrícola? 😊`
+}
+
+function generarCodigoPedido(nombre: string, direccion: string, telefono: string): string {
+  const partesNombre = norm(nombre).split(' ').filter(Boolean)
+  const stop = new Set(['colonia','calle','avenida','pasaje','residencial','municipio','departamento','canton','caserio','casa','punto','encuentro'])
+  const partesDireccion = norm(direccion).split(' ').filter(w => w.length > 2 && !stop.has(w))
+  const primeraLetraNombre = (partesNombre[0]?.[0] || 'X').toUpperCase()
+  const inicialesDireccion = (partesDireccion.slice(0, 3).map(w => w[0]).join('') || 'DIR').toUpperCase()
+  const digitosTelefono = telefono.replace(/\D/g, '')
+  const telefonoLocal = /^503\d{8}$/.test(digitosTelefono) ? digitosTelefono.slice(3) : digitosTelefono
+  const dosDigitos = telefonoLocal.slice(0, 2) || '00'
+  const sufijo = randomUUID().replace(/-/g, '').slice(0, 6).toUpperCase()
+  return `${primeraLetraNombre}${inicialesDireccion}${dosDigitos}-${sufijo}`
+}
+
+function variantesMencionadas(msg: string, hist: Conv[], prod: Producto) {
+  // No preguntar ni sugerir una variante. Solo registrarla si el cliente la mencionó espontáneamente.
+  // Evita contaminar el nuevo pedido con un color/talla que el cliente había mencionado para otro artículo.
+  let inicio = Math.max(0, hist.length - 4)
+  for (let i = hist.length - 1; i >= 0; i--) {
+    const entrada = String(hist[i]?.entrada || '')
+    const respuesta = String(hist[i]?.respuesta || '')
+    const mencionaProducto = buscarProducto(entrada, [prod])?.sku === prod.sku
+    const fichaProductoActual = /🛍/u.test(respuesta) && respuesta.split(/\r?\n/).slice(0, 3).some(linea => norm(linea).includes(norm(prod.nombre_completo)))
+    if (mencionaProducto || fichaProductoActual) { inicio = i; break }
+  }
+  const textoCliente = norm([msg, ...hist.slice(inicio).map(h => h.entrada)].join(' '))
+  const tallaNorm = norm(prod.talla || '')
+  const colorNorm = norm(prod.color || '')
+  const talla = tallaNorm && tallaNorm !== 'unica' &&
+    (textoCliente.includes(`talla ${tallaNorm}`) || new RegExp(`\\b${tallaNorm.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(textoCliente)) ? prod.talla : null
+  const color = colorNorm && colorNorm !== 'unica' && textoCliente.includes(colorNorm) ? prod.color : null
+  return { talla, color }
 }
 
 function recolectar(st: Estado, msg: string, analisis: AnalisisTurno = ANALISIS_VACIO) {
   const partes = msg.split(/[|\n;,]+/).map((s) => s.trim()).filter(Boolean)
   let dirDeEste = false
-  let algo = false
   for (const p of partes) {
     const pago = detectaPago(p)
     if (pago) {
       st.metodo_pago = pago
-      algo = true
       continue
     }
     if (esDireccion(p)) {
       st.direccion = dirDeEste && st.direccion ? `${st.direccion}, ${p}` : p
       dirDeEste = true
-      algo = true
       continue
     }
     if (!st.nombre_cliente) {
       const nom = detectaNombre(p)
       if (nom) {
         st.nombre_cliente = nom
-        algo = true
-      }
+        }
     }
   }
   // Use structured extraction only for values explicitly present in the current message.
-  if (!st.nombre_cliente && analisis.nombre_cliente && !esDireccion(analisis.nombre_cliente)) {
-    const nom = detectaNombre(analisis.nombre_cliente) || analisis.nombre_cliente.trim()
-    if (nom && nom.length <= 100) st.nombre_cliente = nom
+  if (!st.nombre_cliente && analisis.nombre_cliente && !esDireccion(analisis.nombre_cliente) && !detectaPago(analisis.nombre_cliente)) {
+    const crudo = analisis.nombre_cliente.trim().replace(/^(?:mi nombre es|me llamo|soy|nombre)\s*[:,-]?\s+/i, '')
+    const nom = detectaNombre(crudo) || crudo
+    const palabras = nom.split(/\s+/).filter(Boolean)
+    if (nom.length <= 100 && palabras.length >= 2 && palabras.length <= 6 && palabras.every(w => /^[A-Za-zÁÉÍÓÚáéíóúÑñÜü'-]+$/.test(w))) {
+      st.nombre_cliente = nom.replace(/\b\w/g, c => c.toUpperCase())
+    }
   }
-  if (!st.direccion && analisis.direccion && analisis.direccion.trim().length >= 5) {
+  if ((!st.direccion || !direccionSuficiente(st.direccion)) && analisis.direccion && analisis.direccion.trim().length >= 5) {
     st.direccion = analisis.direccion.trim().slice(0, 500)
   }
   if (analisis.metodo_pago) st.metodo_pago = analisis.metodo_pago
-  if (!algo && !st.direccion && msg.trim().length > 12 && !esPedir(msg)) st.direccion = msg.trim()
+  // No inferir dirección solo porque el mensaje sea largo: puede ser una pregunta u objeción.
 }
 
 // ============ AGENTE DE INTERPRETACIÓN DE TURNO ============
@@ -492,8 +675,8 @@ async function analizarTurno(msg: string, st: Estado, disp: Producto[], hist: Co
     const instructions = `Eres un microagente de interpretación para el vendedor de WhatsApp ${AGENTE} de TodoEnUno SV. No conversas con el cliente: analiza su intención en contexto y devuelve solo el objeto exigido por el esquema. El cliente puede escribir con errores, abreviaturas, salvadoreñismos, mensajes partidos, pronombres (ese/esa/lo), sin tildes o con muchas formas equivalentes. Lee el historial reciente y el estado de compra antes de clasificar.\n` +
       `intents: greeting=saludo; catalog=pide catálogo/más productos; product_question=pregunta información/precio de producto; product_choice=menciona o selecciona producto; purchase=quiere comprar/encargar/recibir el producto o confirma que sí lo quiere; provide_order_data=da nombre, dirección o forma de pago; cancel=desiste; human=pide asesor/persona; how_to_order=pregunta cómo comprar; other=resto.\n` +
       `Cuando el estado sea esperando_producto_para_comprar, un producto mencionado debe interpretarse como el producto que quiere comprar y NO debes volver a preguntar si lo quiere. También revisa el historial: si la persona ya dijo que quiere comprar y el asistente le pidió identificar/escribir el producto, su siguiente nombre de producto continúa esa compra aunque el estado guardado diga info/inicio. Cuando la última ficha individual o el estado identifique un producto, mensajes como "sí", "dale", "va", "me lo llevo", "mandamelo", "quiero ese", "hágale", "de una", "lo quiero" pueden confirmar compra. Si está recolectando datos, interpreta el mensaje como datos del pedido cuando corresponda; nunca confundas el nombre de un producto con el nombre de la persona.\n` +
-      `sku debe ser únicamente un SKU literal del catálogo proporcionado; usa cadena vacía si no puedes determinarlo. No inventes SKUs ni datos personales. nombre_cliente, direccion, metodo_pago solo deben contener información explícita del mensaje_actual, no la deduzcas de mensajes antiguos; si no aparece en el mensaje actual, usa cadena vacía. metodo_pago solo puede ser efectivo o transferencia; acepta equivalencias como "contra entrega", "cuando llegue" y "le pago al recibir" para efectivo, y "depósito" o "por banco" para transferencia.\n` +
-      `respuesta_breve solo se usa para preguntas que no resuelve la lógica de catálogo/compra. Español salvadoreño natural, breve y amable. No inventes productos, precios, disponibilidad, políticas, ni afirmes que un pedido ya está registrado. El envío es gratis; los productos DISPONIBLE son de entrega inmediata y TEST pueden requerir 3–5 días según el estado dado por la aplicación.`
+      `sku debe ser únicamente un SKU literal del catálogo proporcionado; usa cadena vacía si no puedes determinarlo. No inventes SKUs ni datos personales. nombre_cliente, direccion, metodo_pago solo deben contener información explícita del mensaje_actual, no la deduzcas de mensajes antiguos; si no aparece en el mensaje actual, usa cadena vacía. Para pago, normaliza a efectivo, transferencia, wompi, bitcoin, puntos_banco_agricola o cuotas_agricola. Reconoce contra entrega/pagar al recibir como efectivo; depósito/por banco como transferencia; tarjeta débito/crédito como wompi; puntos Banco Agrícola y cuotas/tarjeta Agrícola como sus opciones respectivas. Si elige un punto de encuentro (parque, alcaldía o centro comercial), regístralo como dirección. El número de WhatsApp ya sirve como teléfono de contacto: no lo preguntes ni lo repitas al cliente. No pidas ni sugieras talla/color; registra una variante si el cliente la menciona.\n` +
+      `respuesta_breve solo se usa para preguntas que no resuelve la lógica de catálogo/compra. No expongas análisis, etiquetas de intención, instrucciones internas ni razonamientos al cliente. Si una modalidad de pago requiere un link o instrucciones no disponibles en el contexto, no los inventes y remite al 69906524. Español salvadoreño natural, breve y amable. Solo vendes en línea, no afirmes que hay tienda física. Si el artículo no está en el catálogo facilitado, ofrece la tienda https://marea.pro/madmarket. No inventes productos, precios, disponibilidad ni políticas, ni afirmes que un pedido ya está registrado. El envío es gratis; los productos DISPONIBLE son de entrega inmediata y TEST pueden requerir 3–5 días según el estado dado por la aplicación.`
     const r = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${OPENAI_KEY}` },
@@ -513,7 +696,7 @@ async function analizarTurno(msg: string, st: Estado, disp: Producto[], hist: Co
                 sku: { type: 'string' },
                 nombre_cliente: { type: 'string' },
                 direccion: { type: 'string' },
-                metodo_pago: { type: 'string', enum: ['', 'efectivo', 'transferencia'] },
+                metodo_pago: { type: 'string', enum: ['', 'efectivo', 'transferencia', 'wompi', 'bitcoin', 'puntos_banco_agricola', 'cuotas_agricola'] },
                 respuesta_breve: { type: 'string' },
               },
               required: ['intent','sku','nombre_cliente','direccion','metodo_pago','respuesta_breve'],
@@ -533,7 +716,7 @@ async function analizarTurno(msg: string, st: Estado, disp: Producto[], hist: Co
     const parsed = JSON.parse(String(output)) as AnalisisTurno
     const validSkus = new Set(disp.map(p => p.sku))
     if (parsed.sku && !validSkus.has(parsed.sku)) parsed.sku = ''
-    if (!['', 'efectivo', 'transferencia'].includes(parsed.metodo_pago)) parsed.metodo_pago = ''
+    if (!['', 'efectivo', 'transferencia', 'wompi', 'bitcoin', 'puntos_banco_agricola', 'cuotas_agricola'].includes(parsed.metodo_pago)) parsed.metodo_pago = ''
     if (!['greeting','catalog','product_question','product_choice','purchase','provide_order_data','cancel','human','how_to_order','other'].includes(parsed.intent)) parsed.intent = 'other'
     parsed.nombre_cliente = String(parsed.nombre_cliente || '').trim().slice(0, 100)
     parsed.direccion = String(parsed.direccion || '').trim().slice(0, 500)
@@ -552,13 +735,17 @@ function hayCompraPendienteEnHistorial(hist: Conv[]): boolean {
   if (ultima && (esCancelar(ultima.entrada) || /sin problema.*cuando queras comprar|cancelamos|pedido cancelado/.test(norm(ultima.respuesta)))) return false
   const compra = /\b(lo quiero|lo llevo|me lo llevo|mandame|mandeme|me lo manda|quiero comprar|quiero uno|apartar|pedido|encargar|de una|haganlo|hagale)\b/
   const pideProducto = /(escribime.*producto|nombre del producto|cual producto|que producto.*comprar|producto que queres comprar|identificar cual producto|no hace falta volver a confirmar)/
-  return hist.slice(-4).some(h => compra.test(norm(h.entrada)) && pideProducto.test(norm(h.respuesta))) ||
-    hist.slice(-2).some(h => /ya entendi que queres comprar|seguimos directamente con tus datos/.test(norm(h.respuesta)))
+  return hist.slice(-12).some(h => compra.test(norm(h.entrada)) && pideProducto.test(norm(h.respuesta))) ||
+    hist.slice(-4).some(h => /ya entendi que queres comprar|seguimos directamente con tus datos/.test(norm(h.respuesta)))
 }
 
 // ============ MINI AGENTE ============
 async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[], hist: Conv[]): Promise<string> {
   const n = norm(msg)
+
+  if (esPostventa(msg)) {
+    return `Para pedidos retrasados, cambios o reclamos, comunicate directamente al 69906524 📞. Si es una compra nueva, también te ayudo por aquí 😊`
+  }
 
   if (esAsesor(msg)) {
     st.paso = 'asesor'
@@ -570,8 +757,31 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
     return `¡Hola! 👋 Soy *${AGENTE}* de TodoEnUno SV 💛\nEstoy actualizando el catálogo en este momento. ¿Querés que te pase con un asesor?\n👉 Responde: asesor`
   }
 
-  const analisis = await analizarTurno(msg, st, disp, hist)
-  const quiereComprar = esPedir(msg) || analisis.intent === 'purchase'
+  // El último producto mostrado prevalece sobre un SKU viejo si la respuesta más reciente
+  // fue una ficha individual. Esto evita comprar accidentalmente el artículo anterior.
+  const skuGuardado = st.last_sku ? disp.find(p => p.sku === st.last_sku) : null
+  const productoEnFichaReciente = productoDeUltimaRespuesta(hist, disp)
+  let estadoCambio = false
+  if (productoEnFichaReciente && st.paso !== 'asesor') {
+    if (st.last_sku !== productoEnFichaReciente.sku || st.last_nombre !== productoEnFichaReciente.nombre_completo || st.paso === 'confirmado' || st.paso === 'esperando_producto_para_comprar') {
+      st.last_sku = productoEnFichaReciente.sku
+      st.last_nombre = productoEnFichaReciente.nombre_completo
+      // La última ficha representa una nueva selección, aun si hubo un pedido anterior.
+      if (st.paso === 'confirmado' || st.paso === 'esperando_producto_para_comprar') st.paso = 'info'
+      estadoCambio = true
+    }
+  } else if (skuGuardado) {
+    st.last_nombre = skuGuardado.nombre_completo
+  }
+  if (estadoCambio) await saveState(st)
+
+  const confirmaFicha = Boolean(productoEnFichaReciente) && st.paso !== 'recolectando' && esAceptacionCorta(msg)
+  // Caso crítico: ficha individual + "sí, lo quiero" se resuelve por código, sin depender
+  // de que un modelo interprete el pronombre ni gastar otra llamada de IA.
+  const analisis = confirmaFicha
+    ? { ...ANALISIS_VACIO, intent: 'purchase' as const, sku: productoEnFichaReciente!.sku }
+    : await analizarTurno(msg, st, disp, hist)
+  const quiereComprar = esPedir(msg) || analisis.intent === 'purchase' || confirmaFicha
   if (analisis.intent === 'human' && !esAsesor(msg)) {
     st.paso = 'asesor'
     await saveState(st)
@@ -580,7 +790,7 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
 
   // Recupera la intención pendiente tanto desde el estado persistido como desde los últimos intercambios
   // (esto repara chats que quedaron en 'info' por la versión anterior del webhook).
-  if (st.paso === 'info' && hayCompraPendienteEnHistorial(hist)) {
+  if (st.paso === 'info' && hayCompraPendienteEnHistorial(hist) && !confirmaFicha) {
     st.paso = 'esperando_producto_para_comprar'
     await saveState(st)
   }
@@ -601,12 +811,9 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
       st.last_nombre = prodPendiente.nombre_completo
       st.paso = 'recolectando'
       await saveState(st)
-      return `¡Perfecto! 🎉 Ya tengo el producto: *${st.last_nombre}*. Seguimos con tu compra 😊\n\n${faltantes(st)}`
+      return `¡Perfecto! 🎉 Ya tengo el producto: *${st.last_nombre}*. Seguimos con tu compra 😊\n\n${preguntarDatos(st)}`
     }
-    if (analisis.intent === 'other' && analisis.respuesta_breve) {
-      return `${analisis.respuesta_breve}\n\nY seguimos con tu compra: solo necesito que me digás qué producto querés 😊`
-    }
-    return `¡Sí, te ayudo a comprarlo! 😊 Escribime el nombre del producto o elegilo del catálogo y seguimos directamente con tus datos; no hace falta volver a confirmar que lo querés 💛\n\n${listar(disp, 5)}`
+    return `¡Claro! 😊 Para seguir con la compra que ya iniciamos, decime el nombre del producto que querés llevar. Si no aparece en este catálogo, podés pedirlo directamente en https://marea.pro/madmarket 💛`
   }
 
   // ---- Recolección de datos del pedido ----
@@ -617,7 +824,7 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
         st.last_sku = nuevo.sku
         st.last_nombre = nuevo.nombre_completo
         await saveState(st)
-        return `Perfecto, cambiamos tu elección a *${nuevo.nombre_completo}* 😊\n\n${faltantes(st)}`
+        return `Perfecto, cambiamos tu elección a *${nuevo.nombre_completo}* 😊\n\n${preguntarDatos(st)}`
       }
     }
     if (n === 'reintentar' && st.nombre_cliente && st.direccion && st.metodo_pago) {
@@ -640,27 +847,50 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
       }
       const nombreProd = prod.nombre_completo
       const total = prod.precioNum
+      const pedidoCodigo = st.pedido_codigo_pendiente || generarCodigoPedido(st.nombre_cliente || '', st.direccion || '', tel)
+      st.pedido_codigo_pendiente = pedidoCodigo
+      if (!(await saveState(st))) {
+        return `Tengo los datos de tu pedido, pero no pude guardar el estado de forma segura 😕 No he confirmado la compra. Escribí *reintentar* en un momento o *asesor* para ayudarte. 💛`
+      }
+      const variante = variantesMencionadas(msg, hist, prod)
+      const estadoPedido = 'nuevo'
       const { error } = await supabase.from('whatsapp_orders').insert({
         telefono: tel,
         nombre: st.nombre_cliente,
-        telefono_cliente: tel,
+        telefono_cliente: tel, // Usa el número de WhatsApp; nunca se vuelve a preguntar.
         direccion: st.direccion,
-        items: [{ sku: st.last_sku, nombre: nombreProd, qty: 1, precio: total, talla: prod?.talla || null, color: prod?.color || null }],
+        items: [{ sku: st.last_sku, nombre: nombreProd, qty: 1, precio: total, talla: variante.talla, color: variante.color }],
         total,
-        estado: 'nuevo',
+        estado: estadoPedido,
         metodo_pago: st.metodo_pago,
+        pedido_codigo: pedidoCodigo,
+        codigo_registro: 'TD12K26',
       })
       if (error) {
         console.error('order insert', error.message)
-        await saveState(st)
-        return `Casi lo tenemos, pero hubo un problema guardando tu pedido 😕 Tus datos siguen guardados. Escribí *reintentar* y lo intento de nuevo, o *asesor* para ayudarte.`
+        // Si el primer INSERT alcanzó a confirmar en PostgreSQL pero se perdió la respuesta,
+        // un reintento usa el mismo pedido_codigo. Verificamos ese ID antes de decir que falló.
+        const { data: pedidoExistente, error: consultaError } = await supabase
+          .from('whatsapp_orders')
+          .select('pedido_codigo')
+          .eq('pedido_codigo', pedidoCodigo)
+          .maybeSingle()
+        if (consultaError || !pedidoExistente) {
+          await saveState(st)
+          return `Casi lo tenemos, pero no pude verificar el registro de tu pedido 😕 Tus datos siguen guardados. Escribí *reintentar* y lo verifico otra vez, o *asesor* para ayudarte. 💛`
+        }
       }
       st.paso = 'confirmado'
+      st.pedido_codigo_pendiente = null
       await saveState(st)
-      return `✅ *PEDIDO CONFIRMADO* 🎉\n\n🛍 ${nombreProd}${prod?.talla ? ` - Talla ${prod.talla}` : ''}${prod?.color ? ` - ${prod.color}` : ''}\n💰 Total: *${fmtPrecio(total)}*\n👤 ${st.nombre_cliente}\n📍 ${st.direccion}\n💳 ${st.metodo_pago}\n\n🚚 *Envío GRATIS 24-72h*\n¡Gracias! Soy ${AGENTE} 💛`
+      const avisoPago = st.metodo_pago && st.metodo_pago !== 'efectivo'
+        ? `\n\nℹ️ Para las instrucciones de pago de ${etiquetaPago(st.metodo_pago)}, comunicate con atención al cliente al 69906524. No compartas datos de tarjeta por este chat.`
+        : ''
+      const tiempoEntrega = prod.state === 'TEST' ? 'bajo pedido, estimado 3–5 días hábiles' : 'de 1 a 3 días hábiles'
+      return `✅ PEDIDO REGISTRADO 🎉\n\nID de pedido: ${pedidoCodigo}\nCódigo de registro: TD12K26\n\n🛍 ${nombreProd}${variante.talla ? ` - Talla ${variante.talla}` : ''}${variante.color ? ` - ${variante.color}` : ''}\n💰 Total: *${fmtPrecio(total)}*\n👤 ${st.nombre_cliente}\n📍 ${st.direccion}\n💳 ${etiquetaPago(st.metodo_pago)}\n\n🚚 Envío GRATIS en todo El Salvador; entrega ${tiempoEntrega}.\n¡Gracias por comprar en TodoEnUno SV! Soy ${AGENTE} 💛${avisoPago}`
     }
     await saveState(st)
-    return `¡Perfecto! Soy ${AGENTE} 😊 Solo me falta:\n\n${faltantes(st)}`
+    return preguntarDatos(st)
   }
 
   if (st.paso === 'confirmado' && quiereComprar && (!analisis.sku || analisis.sku === st.last_sku) && !buscarProducto(msg, disp)) {
@@ -688,7 +918,7 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
     if (st.last_sku) {
       st.paso = 'recolectando'
       await saveState(st)
-      return `¡Muy fácil! Soy ${AGENTE} 😊 Solo necesito:\n\n${faltantes(st)}\n\nY listo, envío GRATIS 24-72h 🚚`
+      return `¡Muy fácil! Soy ${AGENTE} 😊\n\n${preguntarDatos(st)}\n\n🚚 Envío gratis en todo El Salvador; normalmente de 1 a 3 días hábiles.`
     }
     return `¡Fácil! Soy ${AGENTE} 😊 Elegí un producto, escribe *Lo quiero* y te pido nombre, dirección y forma de pago. Envío GRATIS 🚚\n\nEscribí: catalogo`
   }
@@ -705,12 +935,12 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
       st.last_nombre = elegido.nombre_completo
       st.paso = 'recolectando'
       await saveState(st)
-      return `¡Excelente elección! 🎉 Te ayudo con *${st.last_nombre}*.\n\n${faltantes(st)}`
+      return `¡Excelente elección! 🎉 Te ayudo con *${st.last_nombre}*.\n\n${preguntarDatos(st)}`
     }
     // Si se perdió el estado no inventar el producto ni caer en una respuesta genérica.
     st.paso = 'esperando_producto_para_comprar'
     await saveState(st)
-    return `¡Con gusto! 😊 Ya entendí que querés comprar. Solo necesito identificar cuál producto: escribime su nombre o elegilo del catálogo y seguimos directamente con tus datos, sin volver a preguntarte si lo querés 💛\n\n${listar(disp, 5)}`
+    return `¡Con gusto! 😊 ¿Cuál producto querés llevar? Podés escribirme el nombre como lo recordés o elegir una de estas opciones:\n\n${listar(disp, 5)}\n\nSi el artículo que buscás no aparece en mi catálogo, también podés pedirlo directamente en nuestra tienda en línea: https://marea.pro/madmarket 💛`
   }
 
   if (esListar(msg) || analisis.intent === 'catalog') {
@@ -729,6 +959,9 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
     return fichaProducto(prod)
   }
 
+  if (['product_question', 'product_choice'].includes(analisis.intent)) {
+    return `¡Gracias por consultarme! 😊 En este chat solo tengo acceso a una parte del catálogo. Podés revisar y pedir el artículo directamente en nuestra tienda en línea: https://marea.pro/madmarket 💛`
+  }
   if (analisis.respuesta_breve && analisis.intent === 'other') return analisis.respuesta_breve
   return `¡Te ayudo con gusto! 😊 Puedo darte precio y detalles, mostrarte el catálogo o ayudarte a comprar. Escribí *catálogo* o mandame el nombre del producto 💛`
 }
@@ -738,7 +971,7 @@ async function miniAgente(tel: string, msg: string, st: Estado, disp: Producto[]
 function protegerCoherencia(respuesta: string, st: Estado): string {
   const r = norm(respuesta)
   if (st.paso === 'recolectando' && /(que producto queres|nombre del producto|te lo aparto|responde lo quiero|si lo queres)/.test(r)) {
-    return `Ya tengo tu producto: *${st.last_nombre || 'el artículo elegido'}* 😊 No necesitás volver a elegirlo. Para completar la compra solo me falta:\n\n${faltantes(st)}`
+    return `¡Perfecto! Ya tengo *${st.last_nombre || 'el artículo elegido'}* 😊\n\n${preguntarDatos(st)}`
   }
   if (st.paso === 'esperando_producto_para_comprar' && /(te lo aparto|responde lo quiero|confirmame si lo queres)/.test(r)) {
     return `Ya entendí que querés comprar 😊 Solo necesito que me digás el nombre del producto. Después seguimos directamente con los datos del pedido.`
@@ -776,6 +1009,53 @@ async function unirMensajes(tel: string, raw: string): Promise<string | null> {
     return raw
   }
 }
+// Extrae texto tanto de mensajes entrantes como de mensajes enviados por Evolution API.
+function extraerTextoEvolution(data: any): string {
+  if (typeof data?.message === 'string') return data.message.trim()
+  if (typeof data?.data?.message === 'string') return data.data.message.trim()
+  let m = data?.message || data?.data?.message || data || {}
+  for (let depth = 0; depth < 3; depth++) {
+    if (m?.ephemeralMessage?.message) m = m.ephemeralMessage.message
+    else if (m?.viewOnceMessage?.message) m = m.viewOnceMessage.message
+    else if (m?.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message
+    else break
+  }
+  return String(
+    m?.conversation || m?.extendedTextMessage?.text || m?.imageMessage?.caption ||
+    m?.buttonsResponseMessage?.selectedDisplayText || m?.buttonsResponseMessage?.selectedButtonId ||
+    m?.templateButtonReplyMessage?.selectedDisplayText || m?.templateButtonReplyMessage?.selectedId ||
+    m?.interactiveResponseMessage?.body?.text || m?.listResponseMessage?.singleSelectReply?.selectedRowId ||
+    m?.buttonsMessage?.content?.text || m?.text || data?.text || data?.messageText || ''
+  ).trim()
+}
+
+async function guardarMensajeSalienteEvolution(data: any): Promise<boolean> {
+  const key = data?.key || data?.message?.key || {}
+  // SEND_MESSAGE debe ser un evento de salida; no registrar como salida cualquier evento entrante.
+  if (key.fromMe === false) return true
+  const jid = String(key.remoteJid || data?.remoteJid || data?.to || data?.number || '')
+  if (!jid || jid.includes('@g.us') || jid.includes('status@broadcast')) return true
+  const alt = String(key.senderPn || key.remoteJidAlt || key.participantPn || data?.senderPn || '')
+  const number = jid.includes('@lid') ? (alt ? cleanNumber(alt) : '') : cleanNumber(jid)
+  const tel = getKey(number)
+  const texto = extraerTextoEvolution(data).slice(0, 5000)
+  if (!tel || tel.length < 8 || !texto) return true
+
+  // Usar el ID de Evolution permite que sus reintentos no dupliquen memoria.
+  const messageId = String(key.id || data?.messageId || data?.id || randomUUID())
+  const { error } = await supabase.from('whatsapp_outbound_memory').upsert({
+    message_id: messageId,
+    telefono: tel,
+    texto,
+    created_at: new Date().toISOString(),
+  }, { onConflict: 'message_id', ignoreDuplicates: true })
+  if (error) {
+    console.error('save outbound memory', error.message)
+    return false
+  }
+  return true
+}
+
 // ============ WEBHOOK ============
 const vistos = new Set<string>()
 
@@ -786,36 +1066,23 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: false, error: 'Webhook configuration missing' }, { status: 503 })
     }
     const body = await req.json().catch(() => ({}))
-    const ev = String(body?.event || '').toLowerCase().replace(/_/g, '.')
+    const ev = String(body?.event || '').toLowerCase().replace(/[_-]/g, '.')
+    const data = Array.isArray(body?.data) ? body.data[0] : body?.data || {}
+    const eventPath = new URL(req.url).pathname.toLowerCase()
+    const esEventoSalida = ev === 'send.message' || eventPath.endsWith('/send-message')
+    if (esEventoSalida) {
+      const guardado = await guardarMensajeSalienteEvolution(data)
+      return NextResponse.json({ ok: guardado })
+    }
     if (ev && ev.indexOf('messages.upsert') === -1) return NextResponse.json({ ok: true })
 
-    const data = Array.isArray(body?.data) ? body.data[0] : body?.data || {}
     const key = data?.key || {}
     if (key.fromMe) return NextResponse.json({ ok: true })
 
     const jid: string = key.remoteJid || ''
     if (!jid || jid.indexOf('@g.us') !== -1 || jid.indexOf('status@broadcast') !== -1) return NextResponse.json({ ok: true })
 
-    let m = data?.message || {}
-    // Evolution puede envolver mensajes de texto en ephemeral/view-once.
-    for (let depth = 0; depth < 3; depth++) {
-      if (m?.ephemeralMessage?.message) m = m.ephemeralMessage.message
-      else if (m?.viewOnceMessage?.message) m = m.viewOnceMessage.message
-      else if (m?.viewOnceMessageV2?.message) m = m.viewOnceMessageV2.message
-      else break
-    }
-    const raw = String(
-      m.conversation ||
-        m.extendedTextMessage?.text ||
-        m.imageMessage?.caption ||
-        m.buttonsResponseMessage?.selectedDisplayText ||
-        m.buttonsResponseMessage?.selectedButtonId ||
-        m.templateButtonReplyMessage?.selectedDisplayText ||
-        m.templateButtonReplyMessage?.selectedId ||
-        m.interactiveResponseMessage?.body?.text ||
-        m.listResponseMessage?.singleSelectReply?.selectedRowId ||
-        ''
-    ).trim()
+    const raw = extraerTextoEvolution(data)
     if (!raw) return NextResponse.json({ ok: true })
 
     const alt: string = key.senderPn || key.remoteJidAlt || key.participantPn || ''
@@ -851,9 +1118,13 @@ export async function POST(req: NextRequest) {
       const texto = protegerCoherencia(respuestaAgente, st)
       const botones = botonesPara(unido, texto)
 
-      await sendWhatsApp(number, texto, botones)
-      await saveConv(tel, unido, texto)
-      return NextResponse.json({ ok: true })
+      const enviado = await sendWhatsApp(number, texto, botones)
+      if (enviado) {
+        await saveConv(tel, unido, texto)
+      } else {
+        console.error('Todd reply not delivered; skipped conversation-history insert', { step: st.paso || 'inicio' })
+      }
+      return NextResponse.json({ ok: enviado })
     } finally {
       await liberarBloqueoCliente(tel, lockToken)
     }
@@ -864,5 +1135,5 @@ export async function POST(req: NextRequest) {
 }
 
 export async function GET() {
-  return NextResponse.json({ ok: true, service: 'todoenuno-whatsapp-salesbot', instance: EVO_INSTANCE })
+  return NextResponse.json({ ok: true, service: 'todoenuno-whatsapp-salesbot', instance: EVO_INSTANCE, version: BUILD_VERSION, model: OPENAI_MODEL })
 }
