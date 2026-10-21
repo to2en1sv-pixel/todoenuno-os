@@ -1,16 +1,13 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
-import OpenAI from 'openai'
 
 export const dynamic = 'force-dynamic'
-export const maxDuration = 60
+export const maxDuration = 30
 
 const supabase = createClient(
   process.env.SUPABASE_URL!,
   process.env.SUPABASE_SERVICE_KEY!
 )
-
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! })
 
 const EVOLUTION_API_URL = process.env.EVOLUTION_API_URL!
 const EVOLUTION_INSTANCE = process.env.EVOLUTION_INSTANCE || 'eee'
@@ -51,7 +48,7 @@ async function getState(telefono: string) {
 
 async function saveState(telefono: string, patch: Record<string, any>) {
   const current = await getState(telefono)
-  const next = { ...current, ...patch, telefono }
+  const next = { ...current, ...patch, telefono, updated_at: new Date().toISOString() }
   await supabase.from('whatsapp_state').upsert(next, { onConflict: 'telefono' })
   return next
 }
@@ -60,6 +57,7 @@ async function getDisponibles() {
   const { data: prods } = await supabase
     .from('productos_variantes')
     .select('sku, nombre_completo, precio, talla, color, image_url')
+
   if (!prods?.length) return []
 
   const skus = prods.map((p) => p.sku)
@@ -72,7 +70,7 @@ async function getDisponibles() {
 
   return prods
     .map((p) => {
-      const i = invMap.get(p.sku)
+      const i = invMap.get(p.sku) as any
       const state = i?.state || 'NO_DISPONIBLE'
       const qty = i?.qty ?? 0
       let disponible = false
@@ -117,10 +115,7 @@ async function sendText(number: string, text: string) {
           'Content-Type': 'application/json',
           apikey: EVOLUTION_API_KEY,
         },
-        body: JSON.stringify({
-          number,
-          text,
-        }),
+        body: JSON.stringify({ number, text }),
       }
     )
     return res.ok
@@ -136,9 +131,7 @@ async function sendButtons(
   footer = 'TodoEnUno SV | Envío Gratis 🚚'
 ) {
   const btns = buttons.slice(0, 3).map((b) => ({
-    buttonId: b.toLowerCase().replace(/\s+/g, '_').slice(0, 30),
-    buttonText: { displayText: b },
-    type: 1,
+    displayText: b,
   }))
   try {
     const res = await fetch(
@@ -151,8 +144,7 @@ async function sendButtons(
         },
         body: JSON.stringify({
           number,
-          title: text.slice(0, 60),
-          description: text,
+          text,
           footer,
           buttons: btns,
         }),
@@ -220,7 +212,9 @@ function detectarDireccion(msg: string): string | null {
     lower.includes('municipio') ||
     lower.includes('depto') ||
     lower.includes('departamento') ||
-    (msg.length > 15 && /\d/.test(msg))
+    lower.includes('santa tecla') ||
+    lower.includes('merliot') ||
+    lower.includes('la libertad')
   ) {
     return msg.trim()
   }
@@ -229,212 +223,88 @@ function detectarDireccion(msg: string): string | null {
 
 function detectarPago(msg: string): string | null {
   const lower = norm(msg)
-  if (lower.includes('efectivo') || lower.includes('cash')) return 'efectivo'
-  if (lower.includes('transferencia') || lower.includes('banco') || lower.includes('deposito'))
-    return 'transferencia'
+  if (lower.includes('efectivo')) return 'efectivo'
+  if (lower.includes('transferencia')) return 'transferencia'
+  if (lower.includes('chivo') || lower.includes('bitcoin')) return 'transferencia'
   return null
 }
 
-async function miniAgente(
-  msgRaw: string,
-  telefono: string,
-  st: any,
-  disponibles: any[]
-): Promise<{ respuesta: string; buttons?: string[]; newState?: Record<string, any> }> {
-  const msg = msgRaw.trim()
+async function miniAgente(msg: string, telefono: string, st: any, disponibles: any[]) {
   const msgN = norm(msg)
+  const originalMsg = msg.trim()
 
-  // Buffer already handled outside; here pure intent
-
-  // Handoff humano
-  if (
-    msgN.includes('asesor') ||
-    msgN.includes('humano') ||
-    msgN.includes('persona') ||
-    msgN.includes('hablar con') ||
-    msgN === 'asesor'
-  ) {
-    return {
-      respuesta:
-        'Perfecto, te paso con un asesor humano 👨‍💼\nEn breve te contactan. ¡Gracias por preferirnos! ✨',
-      newState: { paso: 'humano' },
+  // Buscar producto mencionado
+  let prod: any = null
+  if (st.last_sku) {
+    prod = disponibles.find((p) => p.sku === st.last_sku)
+  }
+  if (!prod) {
+    const words = msgN.split(' ').filter((w) => w.length > 3)
+    for (const w of words) {
+      const found = disponibles.find((p) => norm(p.nombre_completo).includes(w))
+      if (found) { prod = found; break; }
     }
   }
+  if (!prod) {
+    prod = disponibles.find((p) => msgN.includes(norm(p.nombre_completo).slice(0, 15)))
+  }
+  if (!prod && disponibles.length > 0) prod = disponibles[0]
 
   // Saludo
-  if (
-    /^(hola|buenas|buen dia|buenas tardes|buenas noches|hey|ola|hi|hello)\b/.test(msgN) ||
-    msgN === 'hola' ||
-    msgN.length < 3
-  ) {
-    const count = disponibles.length
+  if (['hola', 'buenas', 'hey', 'ola', 'buenos dias', 'buenas tardes', 'buenas noches'].some(v => msgN === v || msgN.startsWith(v + ' '))) {
+    const ejemplo = disponibles[0]
     return {
-      respuesta: `¡Hola! 👋 Soy *Lili* de TodoEnUno SV 🇸🇻\nTenemos *${count}* productos disponibles listos para vos.\n¿Qué te gustaría hacer?`,
-      buttons: ['Ver catálogo', 'Asesor'],
-      newState: { paso: 'saludo' },
+      respuesta: `🛍️ *¡Hola! Bienvenido a TodoEnUno* 👋\n\nTenemos *${disponibles.length} productos* disponibles, por ejemplo:\n• *${ejemplo?.nombre_completo || 'PORTA BEBES'}* a *$${ejemplo?.precioNum?.toFixed(2) || '15.00'}*\n\n¿En qué te ayudo hoy? 😊`,
+      buttons: ['🛍️ Ver catálogo', '💬 Asesor'],
+      newState: prod ? { last_sku: prod.sku, last_nombre: prod.nombre_completo } : {},
     }
   }
 
-  // Listar / catálogo
-  if (
-    msgN.includes('catalogo') ||
-    msgN.includes('ver catalogo') ||
-    msgN.includes('que tienen') ||
-    msgN.includes('qué tienen') ||
-    msgN.includes('productos') ||
-    msgN.includes('sobre que tienes') ||
-    msgN.includes('sobre qué tienes') ||
-    msgN.includes('info') ||
-    msgN.includes('lista') ||
-    msgN === 'ver_catalogo' ||
-    msgN === 'catalogo'
-  ) {
-    const lista = disponibles.slice(0, 7)
-    if (!lista.length) {
-      return {
-        respuesta: 'Por el momento estamos actualizando el inventario. Escribime en un rato ✨',
-        buttons: ['Asesor'],
-      }
-    }
-    const body = lista
-      .map((p) => `• *${p.nombre_completo}* - $${p.precioNum.toFixed(2)}`)
-      .join('\n')
+  // Listar
+  if (msgN.includes('catalogo') || msgN.includes('que tienen') || msgN.includes('que venden') || msgN.includes('ver catalogo') || msgN.includes('productos')) {
+    const lista = disponibles.slice(0, 7).map((p) => `• *${p.nombre_completo}* - $${p.precioNum.toFixed(2)}`).join('\n')
     return {
-      respuesta: `🛍️ *Catálogo disponible* (${disponibles.length} items)\n\n${body}\n\nDecime el nombre del que te interese o escribí *lo quiero* ✨`,
+      respuesta: `🛍️ *Tenemos ${disponibles.length} productos* 🥳\n\n${lista}\n\nDecime cuál te gusta y te doy detalles 😊`,
       buttons: ['Ver más', 'Asesor'],
-      newState: { paso: 'listar' },
+      newState: {},
     }
   }
 
-  // Buscar producto específico
-  const matches = disponibles.filter((p) => {
-    const n = norm(p.nombre_completo)
-    return n.includes(msgN) || msgN.split(' ').every((w) => w.length < 3 || n.includes(w))
-  })
-
-  // Si parece búsqueda de producto
-  if (
-    matches.length > 0 ||
-    msgN.includes('precio') ||
-    msgN.includes('cuanto') ||
-    msgN.includes('cuánto') ||
-    msgN.includes('tiene') ||
-    msgN.includes('hay')
-  ) {
-    let prods = matches
-    if (!prods.length) {
-      // fuzzy: tomar los más cercanos por palabras
-      const words = msgN.split(' ').filter((w) => w.length > 2)
-      prods = disponibles
-        .map((p) => {
-          const n = norm(p.nombre_completo)
-          const score = words.reduce((s, w) => s + (n.includes(w) ? 1 : 0), 0)
-          return { p, score }
-        })
-        .filter((x) => x.score > 0)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 3)
-        .map((x) => x.p)
-    }
-
-    if (prods.length === 1) {
-      const p = prods[0]
-      return {
-        respuesta: formatProducto(p),
-        buttons: ['✅ Lo quiero', '🛍️ Ver más', '❓ Duda'],
-        newState: {
-          paso: 'info',
-          last_sku: p.sku,
-          last_nombre: p.nombre_completo,
-        },
-      }
-    }
-    if (prods.length > 1) {
-      const body = prods
-        .slice(0, 5)
-        .map((p) => `• *${p.nombre_completo}* - $${p.precioNum.toFixed(2)}`)
-        .join('\n')
-      return {
-        respuesta: `Encontré esto parecido:\n\n${body}\n\nDecime el nombre exacto o escribí *lo quiero* del que te guste ✨`,
-        buttons: ['Ver catálogo', 'Asesor'],
-        newState: { paso: 'listar' },
-      }
-    }
-    // no match
-    const sugeridos = disponibles.slice(0, 5)
-    const body = sugeridos
-      .map((p) => `• *${p.nombre_completo}* - $${p.precioNum.toFixed(2)}`)
-      .join('\n')
+  // Info de producto específico
+  const esInfo = msgN.includes('info') || msgN.includes('precio') || msgN.includes('cuanto') || msgN.includes('talla') || msgN.includes('color') || prod
+  if (esInfo && prod && !msgN.includes('quiero') && !msgN.includes('pedir') && !msgN.includes('comprar') && !msgN.includes('ordenar')) {
     return {
-      respuesta: `No tengo exactamente eso 😅 pero mirá lo que sí tenemos:\n\n${body}\n\n¿Cuál te llama la atención?`,
-      buttons: ['Ver catálogo', 'Asesor'],
-      newState: { paso: 'listar' },
+      respuesta: `${formatProducto(prod)}\n\n¿Te lo aparto? Decime "lo quiero" 🚚`,
+      buttons: ['✅ Lo quiero', '🛍️ Ver más', '❓ Duda'],
+      newState: { last_sku: prod.sku, last_nombre: prod.nombre_completo },
     }
   }
 
-  // Lo quiero / pedir
-  if (
-    msgN.includes('lo quiero') ||
-    msgN.includes('lo pido') ||
-    msgN.includes('mandeme') ||
-    msgN.includes('mándeme') ||
-    msgN.includes('quiero uno') ||
-    msgN.includes('como lo pido') ||
-    msgN.includes('cómo lo pido') ||
-    msgN.includes('hacer pedido') ||
-    msgN === 'lo_quiero' ||
-    msgN === '✅_lo_quiero'
-  ) {
-    const sku = st.last_sku
-    const nombreProd = st.last_nombre
-    if (!sku) {
-      return {
-        respuesta:
-          '¡Claro! Primero elegí un producto del catálogo 🛍️\nEscribí *catálogo* o el nombre del producto que te interese.',
-        buttons: ['Ver catálogo', 'Asesor'],
-        newState: { paso: 'listar' },
-      }
-    }
-
-    // Recolección de datos
+  // Flujo PEDIR - detectar datos
+  if (msgN.includes('quiero') || msgN.includes('pedir') || msgN.includes('comprar') || msgN.includes('ordenar') || msgN.includes('lo quiero') || msgN.includes('mandeme') || st.paso === 'pedir_datos' || st.nombre_cliente) {
     let nombre = st.nombre_cliente
     let direccion = st.direccion
     let pago = st.metodo_pago
 
-    const posibleNombre = detectarNombre(msg)
-    const posibleDir = detectarDireccion(msg)
-    const posiblePago = detectarPago(msg)
+    // Intentar extraer del mensaje actual
+    const maybeNombre = detectarNombre(originalMsg)
+    const maybeDir = detectarDireccion(originalMsg)
+    const maybePago = detectarPago(originalMsg)
 
-    if (posibleNombre && !nombre) nombre = posibleNombre
-    if (posibleDir && !direccion) direccion = posibleDir
-    if (posiblePago && !pago) pago = posiblePago
+    if (maybeNombre && !nombre) nombre = maybeNombre
+    if (maybeDir) direccion = originalMsg
+    if (maybePago) pago = maybePago
 
-    // Si el mensaje actual es solo el dato
-    if (!nombre && posibleNombre) nombre = posibleNombre
-    if (!direccion && posibleDir) direccion = posibleDir
-    if (!pago && posiblePago) pago = posiblePago
+    // Si mensaje es solo nombre y estamos pidiendo
+    if (!direccion && !pago && maybeNombre && originalMsg.split('|').length === 1) {
+      // ya lo tomamos como nombre
+    }
 
-    const faltan: string[] = []
-    if (!nombre) faltan.push('nombre')
-    if (!direccion) faltan.push('direccion')
-    if (!pago) faltan.push('pago')
+    const okN = !!nombre, okD = !!direccion, okP = !!pago
+    const total = prod?.precioNum || Number(st.last_nombre ? disponibles.find(d=>d.sku===st.last_sku)?.precioNum : 15) || 15
 
-    if (faltan.length === 0) {
-      // Confirmar pedido
-      const prod = disponibles.find((p) => p.sku === sku) || {
-        nombre_completo: nombreProd,
-        precioNum: 0,
-      }
-      const total = prod.precioNum
-      const items = [
-        {
-          sku,
-          nombre: prod.nombre_completo || nombreProd,
-          precio: total,
-          qty: 1,
-        },
-      ]
-
+    if (okN && okD && okP) {
+      const items = [{ nombre: prod?.nombre_completo || st.last_nombre || 'Producto', sku: prod?.sku || st.last_sku, talla: prod?.talla, color: prod?.color }]
       await supabase.from('whatsapp_orders').insert({
         telefono,
         nombre,
@@ -445,94 +315,8 @@ async function miniAgente(
         estado: 'confirmado',
         metodo_pago: pago,
       })
-
       return {
-        respuesta: `✅ *PEDIDO CONFIRMADO* 🎉\n\n🛍️ ${prod.nombre_completo || nombreProd}\n💰 Total: *$${total.toFixed(2)}*\n👤 ${nombre}\n📍 ${direccion}\n💳 Pago: ${pago}\n\n🚚 *Envío GRATIS* 24-72h\n¡Gracias por tu compra! Cualquier duda estoy aquí ✨`,
-        newState: {
-          paso: 'confirmado',
-          nombre_cliente: nombre,
-          direccion,
-          metodo_pago: pago,
-          last_sku: null,
-          last_nombre: null,
-        },
-      }
-    }
-
-    // Pedir lo que falta
-    let pregunta = 'Para confirmar tu pedido necesito:\n'
-    if (!nombre) pregunta += '\n📝 *Nombre completo:*'
-    if (!direccion) pregunta += '\n📍 *Dirección:* colonia, municipio, depto'
-    if (!pago) pregunta += '\n💳 *Pago:* efectivo o transferencia'
-    pregunta += '\n\nEscribime los datos que faltan ✨'
-
-    return {
-      respuesta: pregunta,
-      newState: {
-        paso: 'pedir_datos',
-        nombre_cliente: nombre,
-        direccion,
-        metodo_pago: pago,
-        last_sku: sku,
-        last_nombre: nombreProd,
-      },
-    }
-  }
-
-  // Si estamos en pedir_datos, intentar capturar
-  if (st.paso === 'pedir_datos' || st.paso === 'info') {
-    let nombre = st.nombre_cliente
-    let direccion = st.direccion
-    let pago = st.metodo_pago
-
-    const posibleNombre = detectarNombre(msg)
-    const posibleDir = detectarDireccion(msg)
-    const posiblePago = detectarPago(msg)
-
-    if (posibleNombre) nombre = posibleNombre
-    if (posibleDir) direccion = posibleDir
-    if (posiblePago) pago = posiblePago
-
-    // Si no detectó nada estructurado, asumir que es el dato que falta
-    if (!nombre && !posibleDir && !posiblePago && msg.length > 3 && msg.split(' ').length <= 4) {
-      nombre = msg.trim()
-    } else if (!direccion && msg.length > 10) {
-      direccion = msg.trim()
-    }
-
-    const faltan: string[] = []
-    if (!nombre) faltan.push('nombre')
-    if (!direccion) faltan.push('direccion')
-    if (!pago) faltan.push('pago')
-
-    if (faltan.length === 0 && st.last_sku) {
-      const prod = disponibles.find((p) => p.sku === st.last_sku) || {
-        nombre_completo: st.last_nombre,
-        precioNum: 0,
-      }
-      const total = prod.precioNum
-      const items = [
-        {
-          sku: st.last_sku,
-          nombre: prod.nombre_completo || st.last_nombre,
-          precio: total,
-          qty: 1,
-        },
-      ]
-
-      await supabase.from('whatsapp_orders').insert({
-        telefono,
-        nombre,
-        telefono_cliente: telefono,
-        direccion,
-        items,
-        total,
-        estado: 'confirmado',
-        metodo_pago: pago,
-      })
-
-      return {
-        respuesta: `✅ *PEDIDO CONFIRMADO* 🎉\n\n🛍️ ${prod.nombre_completo || st.last_nombre}\n💰 Total: *$${total.toFixed(2)}*\n👤 ${nombre}\n📍 ${direccion}\n💳 Pago: ${pago}\n\n🚚 *Envío GRATIS* 24-72h\n¡Gracias por tu compra! Cualquier duda estoy aquí ✨`,
+        respuesta: `✅ *PEDIDO CONFIRMADO* 🎉\n\n🛍️ ${prod?.nombre_completo || st.last_nombre}\n💰 Total: *$${total.toFixed(2)}*\n👤 ${nombre}\n📍 ${direccion}\n💳 Pago: ${pago}\n\n🚚 *Envío GRATIS* 24-72h\n¡Gracias por tu compra! Cualquier duda estoy aquí ✨`,
         newState: {
           paso: 'confirmado',
           nombre_cliente: nombre,
@@ -552,81 +336,64 @@ async function miniAgente(
 
     return {
       respuesta: pregunta,
+      buttons: ['✅ Confirmar', '✏️ Cambiar datos'],
       newState: {
         paso: 'pedir_datos',
         nombre_cliente: nombre,
         direccion,
         metodo_pago: pago,
+        last_sku: prod?.sku || st.last_sku,
+        last_nombre: prod?.nombre_completo || st.last_nombre,
       },
     }
   }
 
-  // Solo eso? / objeciones
-  if (
-    msgN.includes('solo eso') ||
-    msgN.includes('nada mas') ||
-    msgN.includes('nada más') ||
-    msgN.includes('es todo')
-  ) {
-    const lista = disponibles.slice(0, 5)
-    const body = lista
-      .map((p) => `• *${p.nombre_completo}* - $${p.precioNum.toFixed(2)}`)
-      .join('\n')
+  // Solo eso? objeciones
+  if (msgN.includes('solo eso') || msgN.includes('nada mas') || msgN.includes('es todo')) {
+    const lista = disponibles.slice(0, 5).map((p) => `• *${p.nombre_completo}* - $${p.precioNum.toFixed(2)}`).join('\n')
     return {
-      respuesta: `¡Claro que no! Tenemos mucho más 🔥\n\n${body}\n\n¿Cuál te gusta?`,
+      respuesta: `¡Claro que no! Tenemos mucho más 🔥\n\n${lista}\n\n¿Cuál te gusta?`,
       buttons: ['Ver catálogo', 'Asesor'],
+      newState: {},
     }
   }
 
-  // Fallback con OpenAI para casos raros
+  // Fallback con OpenAI usando fetch (no SDK) - 0 dependencias extra
   const historial = await getHistorial(telefono)
-  const historialText = historial
-    .map((h) => `Cliente: ${h.entrada}\nLili: ${h.respuesta}`)
-    .join('\n')
+  const historialText = historial.map((h) => `Cliente: ${h.entrada}\nLili: ${h.respuesta}`).join('\n')
 
-  const system = `Sos Lili, vendedora salvadoreña de TodoEnUno SV. Amable, corta, usás "vos", emojis, nunca párrafos largos. Nunca digas "no sé" ni "no tengo información". Si no encontrás producto, ofrecé el más parecido real de la lista. Nunca inventés tallas/colores. Nunca muestres JSON. Temperatura baja.
+  const system = `Sos LILI, vendedora salvadoreña de TodoEnUno SV. Amable, corta, usás "vos", emojis, nunca párrafos largos. Nunca digas "no sé" ni "no tengo información". Si no encontrás producto, ofrecé el más parecido real de la lista. Nunca inventés tallas/colores. Nunca muestres JSON. 
 
 Productos disponibles reales (usa SOLO estos):
-${disponibles
-  .slice(0, 40)
-  .map((p) => `- ${p.nombre_completo} | $${p.precioNum} | ${p.estadoLabel} | sku:${p.sku}`)
-  .join('\n')}
+${disponibles.slice(0, 40).map((p) => `- ${p.nombre_completo} | $${p.precioNum} | ${p.estadoLabel} | sku:${p.sku}`).join('\n')}
 
-Estado actual del cliente: ${JSON.stringify({
-    nombre: st.nombre_cliente,
-    direccion: st.direccion,
-    pago: st.metodo_pago,
-    last_sku: st.last_sku,
-    last_nombre: st.last_nombre,
-    paso: st.paso,
-  })}
+Estado actual: ${JSON.stringify({ nombre: st.nombre_cliente, direccion: st.direccion, pago: st.metodo_pago, last_sku: st.last_sku, last_nombre: st.last_nombre, paso: st.paso })}
 
 Si el cliente quiere comprar, usá last_sku. Si pregunta por producto, buscá en la lista. Respuesta SOLO texto plano bonito para WhatsApp, máximo 4-5 líneas.`
 
   try {
-    const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.2,
-      max_tokens: 350,
-      messages: [
-        { role: 'system', content: system },
-        {
-          role: 'user',
-          content: `Historial reciente:\n${historialText}\n\nMensaje actual del cliente: ${msg}`,
-        },
-      ],
+    const r = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: 'gpt-4o-mini',
+        temperature: 0.2,
+        max_tokens: 350,
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: `Historial reciente:\n${historialText}\n\nMensaje actual del cliente: ${msg}` },
+        ],
+      }),
     })
-    const respuesta =
-      completion.choices[0]?.message?.content?.trim() ||
-      '¡Decime qué producto te interesa y te ayudo al toque! ✨'
-    return {
-      respuesta,
-      buttons: ['Ver catálogo', 'Asesor'],
-    }
+    const j: any = await r.json()
+    const respuesta = j.choices?.[0]?.message?.content?.trim() || '¡Decime qué producto te interesa y te ayudo al toque! ✨'
+    return { respuesta, buttons: ['Ver catálogo', 'Asesor'] }
   } catch {
     return {
-      respuesta:
-        '¡Estoy aquí! Escribí *catálogo* para ver productos o el nombre de lo que buscás ✨',
+      respuesta: '¡Estoy aquí! Escribí *catálogo* para ver productos o el nombre de lo que buscás ✨',
       buttons: ['Ver catálogo', 'Asesor'],
     }
   }
@@ -635,8 +402,6 @@ Si el cliente quiere comprar, usá last_sku. Si pregunta por producto, buscá en
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
-
-    // Evolution webhook payload
     const data = body?.data || body
     const key = data?.key || body?.key
     const remoteJid = key?.remoteJid || data?.remoteJid || ''
@@ -647,7 +412,6 @@ export async function POST(req: NextRequest) {
     const number = remoteJid.replace('@s.whatsapp.net', '').replace(/\D/g, '')
     const telefono = getKey(remoteJid)
 
-    // Extraer texto raw
     const msgContent = data?.message || body?.message || {}
     const raw =
       msgContent.conversation ||
@@ -664,14 +428,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, empty: true })
     }
 
-    // Anti-spam buffer
     await supabase.from('whatsapp_buffer').insert({
       telefono,
       mensaje: raw,
       created_at: new Date().toISOString(),
     })
 
-    // Esperar 3.5s para juntar mensajes
     await new Promise((r) => setTimeout(r, 3500))
 
     const { data: buffered } = await supabase
@@ -684,20 +446,18 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ ok: true, no_buffer: true })
     }
 
-    // Solo procesar si somos el último (evitar race)
     const mensajes = buffered.map((b) => b.mensaje).join(' | ')
     await supabase.from('whatsapp_buffer').delete().eq('telefono', telefono)
 
     const st = await getState(telefono)
     const disponibles = await getDisponibles()
-
     const result = await miniAgente(mensajes, telefono, st, disponibles)
 
     if (result.newState) {
       await saveState(telefono, result.newState)
     }
 
-    await sendWhatsApp(number, result.respuesta, result.buttons)
+    await sendWhatsApp(number, result.respuesta, (result as any).buttons)
     await saveConversation(telefono, mensajes, result.respuesta)
 
     return NextResponse.json({ ok: true })
@@ -708,5 +468,4 @@ export async function POST(req: NextRequest) {
 }
 
 export async function GET() {
-  return NextResponse.json({ status: 'Evolution webhook live', instance: EVOLUTION_INSTANCE })
-}
+  retur
