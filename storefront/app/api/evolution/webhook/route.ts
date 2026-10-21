@@ -424,7 +424,7 @@ function productoDeUltimaRespuesta(hist: Conv[], disp: Producto[]): Producto | n
       // Ficha individual con o sin Markdown: "🛍️ *PORTA BEBES*" / "🛍️ PORTA BEBES".
       for (const rawLine of respuesta.split(/\r?\n/).slice(0, 5)) {
         if (/^\s*[•●▪-]\s*/.test(rawLine)) continue
-        let header = rawLine.trim().replace(/^(?:🛍️?|🛒|📦)\s*/u, '')
+        let header = rawLine.trim().replace(/^(?:🛍️?|🛒|📦)\s*/, '')
         header = header.replace(/^\*+|\*+$/g, '').trim()
         if (!header || header.length > 120) continue
         if (/^(precio|talla|color|disponibilidad|entrega|total|opciones|mira lo que tenemos|te comparto)/i.test(norm(header))) continue
@@ -588,7 +588,7 @@ function variantesMencionadas(msg: string, hist: Conv[], prod: Producto) {
     const entrada = String(hist[i]?.entrada || '')
     const respuesta = String(hist[i]?.respuesta || '')
     const mencionaProducto = buscarProducto(entrada, [prod])?.sku === prod.sku
-    const fichaProductoActual = /🛍/u.test(respuesta) && respuesta.split(/\r?\n/).slice(0, 3).some(linea => norm(linea).includes(norm(prod.nombre_completo)))
+    const fichaProductoActual = /🛍/.test(respuesta) && respuesta.split(/\r?\n/).slice(0, 3).some(linea => norm(linea).includes(norm(prod.nombre_completo)))
     if (mencionaProducto || fichaProductoActual) { inicio = i; break }
   }
   const textoCliente = norm([msg, ...hist.slice(inicio).map(h => h.entrada)].join(' '))
