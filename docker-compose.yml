@@ -11,7 +11,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
   evolution:
-    image: evoapicloud/evolution-api:v2.2.2
+    image: evoapicloud/evolution-api:v2.3.7
     ports:
       - "8080:8080"
     environment:
