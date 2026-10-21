@@ -1,12 +1,13 @@
-import { createClient } from '@supabase/supabase-js';
-export const dynamic = 'force-dynamic';
-const norm = (s: string) => (s || '').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
-const getKey = (jid: string) => jid.split('@')[0].replace(/[^0-9]/g, '').slice(-11);
-const slug = (s: string) => norm(s).replace(/[^a-z0-9]+/g, '-');
-
-async function getState(supa: any, k: string) {
-  const { data } = await supa.from('whatsapp_state').select('*').eq('telefono', k).limit(1).maybeSingle();
-  return data;
+import Redis from 'ioredis';
+const redis = new Redis(process.env.REDIS_URL!); // redis://redis:6379 en docker
+// DEBOUNCE 8s con tu redis existente - arregla image_98f9a5.png
+async function debounceBuffer(k: string, raw: string) {
+  await redis.lpush(`wa:${k}`, raw);
+  await redis.expire(`wa:${k}`, 8);
+  await new Promise(r => setTimeout(r, 8000)); // espera 8s como claude-whatsapp-template
+  const msgs = await redis.lrange(`wa:${k}`, 0, -1);
+  await redis.del(`wa:${k}`);
+  return msgs.reverse().join(' | '); // "juan maariano | efectivo | san salvador"
 }
 async function saveState(supa: any, k: string, u: any) {
   const e = await getState(supa, k);
