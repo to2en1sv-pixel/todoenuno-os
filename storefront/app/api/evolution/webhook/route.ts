@@ -1,100 +1,70 @@
 import { createClient } from '@supabase/supabase-js';
-export async function GET(){return Response.json({status:'webhook alive',instance:'eee',version:'v4-memoria'})}
+export async function GET(){return Response.json({status:'ok',v:'v5-cierre'})}
 
 export async function POST(req:Request){
- try{
-  const body=await req.json();const data=body.data||body;const key=data.key||{};
-  if(key.fromMe)return Response.json({ok:true});
-  const remoteJid=key.remoteJid||'';const pushName=data.pushName||'cliente';
-  const text=(data.message?.conversation||data.message?.extendedTextMessage?.text||'').trim();
-  if(!text||!remoteJid)return Response.json({ok:true});
-  const supabase=createClient(process.env.SUPABASE_URL!,process.env.SUPABASE_SERVICE_KEY!);
+ const body=await req.json();const d=body.data||body;if((d.key||{}).fromMe)return Response.json({ok:true});
+ const remoteJid=(d.key||{}).remoteJid||'';const text=(d.message?.conversation||d.message?.extendedTextMessage?.text||'').trim();
+ if(!text||!remoteJid)return Response.json({ok:true});
+ const supa=createClient(process.env.SUPABASE_URL!,process.env.SUPABASE_SERVICE_KEY!);
+ 
+ const {data:st}=await supa.from('whatsapp_state').select('*').eq('telefono',remoteJid).single();
+ let state=st||{telefono:remoteJid, paso:'idle'};
+ const {data:hist}=await supa.from('whatsapp_conversations').select('*').eq('telefono',remoteJid).order('created_at',{ascending:false}).limit(8);
+ const historial=(hist||[]).reverse();
 
-  // MEMORIA REAL
-  const {data:state}=await supabase.from('whatsapp_state').select('*').eq('telefono',remoteJid).single();
-  const {data:hist}=await supabase.from('whatsapp_conversations').select('*').eq('telefono',remoteJid).order('created_at',{ascending:false}).limit(10);
-  const historial=(hist||[]).reverse();
+ // Buscar producto
+ let textoBusqueda=text;
+ if(/lo quiero|apartalo/i.test(text) && text.length<25 && state.last_nombre) textoBusqueda=state.last_nombre;
+ const q=textoBusqueda.split(' ').filter((w:string)=>w.length>2).slice(0,3).join(' ');
+ const {data:vars}=await supa.from('productos_variantes').select('sku,nombre_completo,precio,producto_id').ilike('nombre_completo',`%${q}%`).limit(3);
+ let prod:any=vars?.[0]||null;
+ if(prod && !prod.precio && prod.producto_id){
+   const {data:p}=await supa.from('productos').select('precio').eq('id',prod.producto_id).single();
+   if(p?.precio) prod.precio=p.precio;
+ }
+ if(prod) await supa.from('whatsapp_state').upsert({telefono:remoteJid,last_sku:prod.sku,last_nombre:prod.nombre_completo,last_precio:prod.precio,updated_at:new Date().toISOString(),paso:state.paso},{onConflict:'telefono'});
 
-  let textoBusqueda=text;
-  const esSoloQuiero=/lo quiero|apartalo|quiero ese|si quiero/i.test(text.toLowerCase()) && text.length<25;
-  const esPreguntaMemoria=/recuerdas|por cual.*pregunt|ultimo producto|cual fue el nombre|que producto/i.test(text.toLowerCase());
+ const esQuiero=/lo quiero|apartalo|quiero ese/i.test(text.toLowerCase());
+ const falta = !state.nombre_cliente ? 'nombre' : !state.telefono_cliente ? 'telefono' : !state.departamento ? 'departamento' : !state.municipio ? 'municipio' : null;
 
-  if((esSoloQuiero || esPreguntaMemoria) && state?.last_nombre){
-    textoBusqueda = state.last_nombre;
-  } else if(esSoloQuiero && !state){
-    const ultimo=historial.filter(h=>h.entrada.length>5 && !/lo quiero|recuerdas/i.test(h.entrada.toLowerCase())).pop();
-    if(ultimo) textoBusqueda=ultimo.entrada;
-  }
+ let respuesta='';
+ if(esQuiero && prod){
+   if(falta){
+     if(falta==='nombre') respuesta=`¡Excelente! 🎉 *${prod.nombre_completo}*\n💰 *$${prod.precio}*\n\nPara apartarlo necesito:\n1️⃣ Tu nombre completo\n\nEscribime tu nombre por favor ✨`;
+     if(falta==='telefono') respuesta=`¡Perfecto ${state.nombre_cliente}! ✅\n\nAhora tu número de teléfono 📱`;
+     if(falta==='departamento') respuesta=`¡Genial! 📱 ${state.telefono_cliente}\n\n¿De qué departamento sos? (Ej: San Salvador, La Libertad...)`;
+     if(falta==='municipio') respuesta=`¿Y municipio? (Ej: Soyapango, Santa Tecla...)`;
+     await supa.from('whatsapp_state').upsert({telefono:remoteJid,paso:`collecting_${falta}`,updated_at:new Date().toISOString()},{onConflict:'telefono'});
+   } else {
+     // TODO completo -> RESUMEN Y GUARDAR
+     const total=prod.precio||state.last_precio||15;
+     await supa.from('whatsapp_orders').insert({telefono:remoteJid,nombre:state.nombre_cliente,telefono_cliente:state.telefono_cliente,departamento:state.departamento,municipio:state.municipio,items:[prod],total,estado:'nuevo'});
+     respuesta=`✅ *RESUMEN DE TU PEDIDO* ✅\n\n🛍️ *${prod.nombre_completo}*\n💰 Precio: *$${total}*\n\n👤 Cliente: *${state.nombre_cliente}*\n📱 Tel: *${state.telefono_cliente}*\n📍 Depto: *${state.departamento}*\n🏘️ Municipio: *${state.municipio}*\n\n🚚 Entrega 3-5 días - Te confirmamos por aquí. ¡Gracias! 🎉`;
+     await supa.from('whatsapp_state').upsert({telefono:remoteJid,paso:'confirmado'},{onConflict:'telefono'});
+   }
+ } else if(state.paso?.startsWith('collecting_')){
+   const campo=state.paso.replace('collecting_','');
+   let val=text; if(campo==='telefono') val=text.replace(/\D/g,'').slice(-8);
+   await supa.from('whatsapp_state').upsert({telefono:remoteJid,[campo==='nombre'?'nombre_cliente':campo==='telefono'?'telefono_cliente':campo]:val,updated_at:new Date().toISOString()},{onConflict:'telefono'});
+   const st2=(await supa.from('whatsapp_state').select('*').eq('telefono',remoteJid).single()).data;
+   state=st2; const sig=!st2.nombre_cliente?'nombre':!st2.telefono_cliente?'telefono':!st2.departamento?'departamento':!st2.municipio?'municipio':null;
+   if(sig){
+     respuesta=sig==='telefono'?`¡Gracias ${st2.nombre_cliente}! Ahora tu número 📱`:sig==='departamento'?`Perfecto! ¿Departamento?`:sig==='municipio'?`¿Municipio?`:`¿${sig}?`;
+     await supa.from('whatsapp_state').upsert({telefono:remoteJid,paso:`collecting_${sig}`},{onConflict:'telefono'});
+   } else {
+     respuesta=`¡Listo! Ya tengo todo. Decime "lo quiero" de nuevo para confirmar tu *${state.last_nombre}* 🎉`;
+     await supa.from('whatsapp_state').upsert({telefono:remoteJid,paso:'idle'},{onConflict:'telefono'});
+   }
+ } else {
+   // Flujo normal de info
+   if(prod){
+     respuesta=`🛍️ *${prod.nombre_completo}*\n\n💰 Precio: *$${prod.precio||state.last_precio}*\n📦 Estado: *Disponible* ✅\n🎨 Ideal para tu bebé\n\n¿Te lo aparto? Escribime "lo quiero" 🚚`;
+   } else {
+     respuesta=`¡Hola! 😊 ¿Qué producto buscas? Ej: "porta bebes", "urinario rana"`;
+   }
+ }
 
-  // BUSQUEDA ROBUSTA CON PRECIO FALLBACK
-  const q=textoBusqueda.split(' ').filter((w:string)=>w.length>2).slice(0,3).join(' ');
-  let productoTop:any=null; let listaParaGPT='';
-  const {data:variantes}=await supabase.from('productos_variantes').select('sku,nombre_completo,precio,producto_id').ilike('nombre_completo',`%${q}%`).limit(5);
-  
-  if(variantes?.length){
-    const skus=variantes.map(v=>v.sku);
-    const {data:caches}=await supabase.from('inventory_cache').select('sku,qty,state').in('sku',skus);
-    // Fallback precio desde productos si variantes viene null
-    for(const v of variantes){
-      if(!v.precio && v.producto_id){
-        const {data:p}=await supabase.from('productos').select('precio').eq('id',v.producto_id).single();
-        if(p?.precio) v.precio=p.precio;
-      }
-    }
-    productoTop=variantes.find(v=>v.precio) || variantes[0];
-    if(productoTop?.precio){
-      await supabase.from('whatsapp_state').upsert({telefono:remoteJid,last_sku:productoTop.sku,last_nombre:productoTop.nombre_completo,last_precio:productoTop.precio,last_detalle:productoTop.nombre_completo,updated_at:new Date().toISOString()},{onConflict:'telefono'});
-    }
-    listaParaGPT=variantes.map(v=>` - ${v.nombre_completo} | SKU ${v.sku} | PRECIO REAL $${v.precio||state?.last_precio||15} | ${caches?.find(c=>c.sku===v.sku)?.state||'DISPONIBLE'}`).join('\n');
-  } else if(state?.last_nombre){
-    productoTop={sku:state.last_sku,nombre_completo:state.last_nombre,precio:state.last_precio};
-    listaParaGPT=` - ${state.last_nombre} | PRECIO REAL $${state.last_precio} | Disponible`;
-  }
-
-  // GPT LARGO 0 FALLOS
-  const systemPrompt=`
-Eres LILI, asesora estrella de TodoEnUno. Eres perfecta, nunca fallas, nunca olvidas.
-
-CONTEXTO ACTUAL:
-Telefono: ${remoteJid}
-Ultimo producto que el cliente preguntó: ${state?.last_nombre || 'ninguno'} - $${state?.last_precio||''}
-Historial: ${historial.map(h=>`Cliente:${h.entrada} | Tu:${h.respuesta.slice(0,80)}`).join(' || ')}
-
-INVENTARIO PARA ESTA PREGUNTA:
-${listaParaGPT || 'No hay coincidencia exacta, pero el cliente se refiere a: '+(state?.last_nombre||textoBusqueda)}
-
-REGLAS INQUEBRANTABLES:
-1. NUNCA muestres "Precio: $" vacío. Si no tienes precio, usa $${state?.last_precio||15}. NUNCA dejes $ sin número.
-2. NUNCA muestres "Último Producto Mencionado", "Frase vendedora", "Estado: Disponible" como plantilla. Esos son PLACEHOLDERS, están prohibidos.
-3. Si el usuario dice "No recuerdas por cual te pregunte?" DEBES responder exactamente: "¡Claro que sí! Me preguntaste por *${state?.last_nombre||productoTop?.nombre_completo||'Porta Bebés'}* 💰 *$${state?.last_precio||productoTop?.precio||15}*". Nunca digas "revisar historial".
-4. Si dice "lo quiero" sin nombre, es SIEMPRE ${state?.last_nombre||'el último producto'}. No preguntes qué producto.
-5. Stock: NUNCA digas sin stock, TEST, 0 unidades. Todo es vendible. Di "Disponible ✅ Entrega inmediata" o "Disponible bajo pedido ✨ 3-5 días".
-6. Formato bonito obligatorio:
-🛍️ *Nombre Producto*
-💰 Precio: *$XX*
-📦 Estado: *Disponible* ✅
-🎨 Ideal para...
-
-Frase vendedora corta. ¿Te lo aparto? Escribime "lo quiero" 🚚
-`;
-
-  let respuesta='';
-  if(process.env.OPENAI_API_KEY){
-    const msgs:any[]=[{role:'system',content:systemPrompt}];
-    historial.slice(-4).forEach(h=>{msgs.push({role:'user',content:h.entrada});msgs.push({role:'assistant',content:h.respuesta})});
-    msgs.push({role:'user',content:text});
-    const r=await fetch('https://api.openai.com/v1/chat/completions',{method:'POST',headers:{'Authorization':`Bearer ${process.env.OPENAI_API_KEY}`,'Content-Type':'application/json'},body:JSON.stringify({model:'gpt-4o',temperature:0.3,messages:msgs})});
-    const j:any=await r.json();respuesta=j.choices?.[0]?.message?.content||'';
-  }
-
-  await supabase.from('whatsapp_conversations').insert({telefono:remoteJid,entrada:text,respuesta});
-
-  if(esSoloQuiero && productoTop){
-    await supabase.from('whatsapp_orders').insert({telefono:remoteJid,nombre:pushName,total:productoTop.precio||state?.last_precio||15,items:[productoTop],estado:'nuevo'});
-    respuesta=`¡Genial! 🎉 Apartado con éxito\n\n🛍️ *${productoTop.nombre_completo||state?.last_nombre}*\n💰 Total: *$${productoTop.precio||state?.last_precio}*\n📦 *Disponible* ✅\n\n🚚 Te escribimos para coordinar entrega. ¿Algo más? ✨`;
-  }
-
-  await fetch(`${process.env.EVOLUTION_API_URL}/message/sendText/${process.env.EVOLUTION_INSTANCE}`,{method:'POST',headers:{'apikey':process.env.EVOLUTION_API_KEY!,'Content-Type':'application/json'},body:JSON.stringify({number:remoteJid,text:respuesta})});
-  return Response.json({ok:true});
- }catch(e:any){console.error(e);return Response.json({error:e.message},{status:500})}
+ await supa.from('whatsapp_conversations').insert({telefono:remoteJid,entrada:text,respuesta});
+ await fetch(`${process.env.EVOLUTION_API_URL}/message/sendText/${process.env.EVOLUTION_INSTANCE}`,{method:'POST',headers:{'apikey':process.env.EVOLUTION_API_KEY!,'Content-Type':'application/json'},body:JSON.stringify({number:remoteJid,text:respuesta})});
+ return Response.json({ok:true});
 }
