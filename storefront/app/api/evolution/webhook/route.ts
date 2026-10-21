@@ -14,16 +14,17 @@ const SB_URL = SB_URL_RAW.startsWith('http') ? SB_URL_RAW : `https://${SB_URL_RA
 const SB_KEY = process.env.SUPABASE_SERVICE_KEY || ''
 const supabase = createClient(SB_URL, SB_KEY, { auth: { persistSession: false } })
 
-type Producto = { sku:string; nombre_completo:string; precio:number; talla:string|null; color:string|null; image_url:string|null; qty:number; state:string; precioNum:number }
+type Producto = { sku:string; nombre_completo:string; precio:number; talla:string|null; color:string|null; qty:number; state:string; precioNum:number; stock:number; es_test:boolean }
 type Estado = { telefono:string; nombre_cliente:string|null; direccion:string|null; metodo_pago:string|null; paso:string|null; last_nombre:string|null; last_sku:string|null }
 
 const norm = (s:string)=> (s||'').toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g,'').replace(/[^a-z0-9\s]/g,' ').replace(/\s+/g,' ').trim()
 const getKey = (jid:string)=> (jid||'').replace(/\D/g,'').slice(-11)
 const cleanNumber = (jid:string)=> (jid||'').replace(/:\d+(?=@)/,'').split('@')[0].replace(/\D/g,'')
 const fmtPrecio = (p:number)=> `$${Number(p||0).toFixed(2).replace(/\.00$/,'')}`
-const estadoTxt = (p:Producto)=> p.state==='DISPONIBLE' && p.qty>0 ? '✅ Entrega inmediata' : '✨ Disponible bajo pedido 3-5 días'
-function evoHeaders(){ return { 'Content-Type':'application/json', apikey:EVO_KEY, 'User-Agent':'axios/1.13.2' } }
+// NATURAL: sin distinción, siempre disponible
+const estadoTxtNatural = ()=> '✅ Disponible'
 
+function evoHeaders(){ return { 'Content-Type':'application/json', apikey:EVO_KEY, 'User-Agent':'axios/1.13.2' } }
 async function sendText(num:string,text:string){
   try{
     const r=await fetch(`${EVO_URL}/message/sendText/${EVO_INSTANCE}`,{method:'POST',headers:evoHeaders(),body:JSON.stringify({number:num,text})})
@@ -31,7 +32,6 @@ async function sendText(num:string,text:string){
     return r.ok
   }catch(e){ console.error(e); return false }
 }
-
 async function getState(tel:string): Promise<Estado>{
   const {data}=await supabase.from('whatsapp_state').select('*').eq('telefono',tel).maybeSingle()
   return (data as Estado) || { telefono:tel, nombre_cliente:null, direccion:null, metodo_pago:null, paso:null, last_nombre:null, last_sku:null }
@@ -42,8 +42,9 @@ async function saveConv(tel:string,entrada:string,respuesta:string){ await supab
 async function getDisponibles(): Promise<Producto[]>{
   let allVars:any[]=[]; let from=0
   for(;;){
-    const {data,error}=await supabase.from('productos_variantes').select('sku,nombre_completo,precio,talla,color,image_url').range(from,from+999)
-    if(error){ console.error('vars',error.message); break }
+    // tu tabla real: sku, nombre_completo, precio, talla, color, stock, estado, es_test
+    const {data,error}=await supabase.from('productos_variantes').select('sku,nombre_completo,precio,talla,color,stock,estado,es_test').range(from,from+999)
+    if(error){ console.error('vars err',error.message); break }
     if(!data||data.length===0) break
     allVars=allVars.concat(data)
     if(data.length<1000) break
@@ -52,7 +53,7 @@ async function getDisponibles(): Promise<Producto[]>{
   let allInv:any[]=[]; from=0
   for(;;){
     const {data,error}=await supabase.from('inventory_cache').select('sku,qty,state').range(from,from+999)
-    if(error){ console.error('inv',error.message); break }
+    if(error){ console.error('inv err',error.message); break }
     if(!data||data.length===0) break
     allInv=allInv.concat(data)
     if(data.length<1000) break
@@ -60,27 +61,58 @@ async function getDisponibles(): Promise<Producto[]>{
   }
   const invMap=new Map<string,{qty:number,state:string}>()
   for(const i of allInv) invMap.set(i.sku,{qty:Number(i.qty)||0, state:String(i.state||'NO_DISPONIBLE').toUpperCase()})
+
   const out:Producto[]=[]
   for(const v of allVars){
-    const inv=invMap.get(v.sku)
-    const state=inv?.state || 'TEST'
-    const qty=inv?.qty ?? 0
-    if(state==='NO_DISPONIBLE') continue
-    if(state!=='DISPONIBLE' && state!=='TEST') continue
+    const estadoVar=String(v.estado||'').toUpperCase()
+    const esTest=Boolean(v.es_test)
+    const stockVar=Number(v.stock)||0
     const precioNum=Number(String(v.precio||0).replace(/[,$\s]/g,''))||0
+
+    // REGLA QUE ME PEDISTE: NO_DISPONIBLE no aparece nunca
+    if(estadoVar==='NO_DISPONIBLE') continue
     if(precioNum<=0) continue
-    out.push({...v, qty, state, precioNum, precio:precioNum})
+    // Si tu tabla dice NO_DISPONIBLE, lo sacamos aunque sea test
+    // Pero si dice DISPONIBLE o es_test TRUE, entra aunque stock 0
+    const inv=invMap.get(v.sku)
+    const stateInv=inv?.state || 'TEST'
+    if(stateInv==='NO_DISPONIBLE' && !esTest && estadoVar!=='DISPONIBLE') continue
+
+    // NATURAL: DISPONIBLE y TEST (es_test true) se venden igual, sin mirar stock
+    const stateFinal = esTest ? 'TEST' : (estadoVar || stateInv || 'DISPONIBLE')
+
+    out.push({
+      sku:v.sku,
+      nombre_completo:v.nombre_completo,
+      precio:precioNum,
+      precioNum,
+      talla:v.talla||null,
+      color:v.color||null,
+      qty:inv?.qty ?? stockVar,
+      stock:stockVar,
+      state:stateFinal,
+      es_test:esTest
+    })
   }
-  console.log('TODD disponibles',out.length)
+  console.log('TODD FINAL disponibles',out.length,'vars',allVars.length,'inv',allInv.length)
   return out
 }
 
-function fichaProducto(p:Producto){
+function fichaProductoNatural(p:Producto){
   const l=[`🛍️ *${p.nombre_completo}*`,`💰 Precio: *${fmtPrecio(p.precioNum)}*`]
-  if(p.talla) l.push(`📏 Talla: ${p.talla}`)
-  if(p.color) l.push(`🎨 Color: ${p.color}`)
-  l.push(`📦 Estado: ${estadoTxt(p)}`,'','¿Te lo aparto? Responde: Lo quiero')
+  if(p.talla) l.push(`📏 Talla: *${p.talla}*`)
+  if(p.color) l.push(`🎨 Color: *${p.color}*`)
+  l.push(`📦 ${estadoTxtNatural()}`, '', '¿Te lo aparto? 😊 Responde: Lo quiero')
   return l.join('\n')
+}
+function listarConTallaColor(disp:Producto[]){
+  return disp.slice(0,8).map(function(p){
+    const extra=[]
+    if(p.talla) extra.push(`Talla ${p.talla}`)
+    if(p.color) extra.push(`${p.color}`)
+    const extraTxt=extra.length? ` (${extra.join(' - ')})` : ''
+    return `• *${p.nombre_completo}*${extraTxt} - ${fmtPrecio(p.precioNum)}`
+  }).join('\n')
 }
 
 const esSaludo = (m:string)=> /^(hola+|holi+|buenas?|buenos dias|buenas tardes|buenas noches|hey|ola|saludos|que tal)\b/.test(norm(m)) && norm(m).split(' ').length<=4
@@ -88,7 +120,7 @@ const esListar = (m:string)=> /(que tienen|que tenes|que vende|catalogo|sobre qu
 const esAsesor = (m:string)=> /(asesor|humano|persona real|agente|hablar con alguien|vendedor|atencion al cliente)/.test(norm(m))
 const esPedir = (m:string)=> /(lo quiero|lo llevo|mandeme|mandame|me lo manda|quiero uno|quiero comprar|comprar|pedir|pedido|ordenar|lo_quiero|apartar|confirmar pedido)/.test(norm(m))
 const esComoPedir = (m:string)=> /(como (hago|pido|compro|se hace).*(pedido|pedir|comprar)|como lo pido)/.test(norm(m))
-const esDuda = (m:string)=> /^(duda|\?|tengo una duda|pregunta)$/.test(norm(m)) || norm(m)==='duda'
+const esTallaColor = (m:string)=> /(que talla|que tallas|tienen talla|talla s|talla m|talla l|talla xl|que color|que colores|tienen colores|color rojo|color azul|color negro)/.test(norm(m))
 const esDireccion = (m:string)=> /(colonia|escalon|san salvador|calle|avenida|pasaje|residencial|municipio|depto|departamento|santa tecla|soyapango|km|casa|#|canton|caserio|lotificacion|urbanizacion|bloque|poligono)/.test(norm(m)) || (/\d/.test(m) && m.length>12)
 
 function detectaPago(m:string): string|null{
@@ -97,7 +129,6 @@ function detectaPago(m:string): string|null{
   if(/transfer|deposito|banco|transferencia/.test(n)) return 'transferencia'
   return null
 }
-// ES5 SAFE - sin \p{L} para que compile en Vercel
 function detectaNombre(m:string): string|null{
   const t=m.trim()
   if(esDireccion(t)||detectaPago(t)) return null
@@ -124,7 +155,14 @@ function buscarProducto(msg:string, disp:Producto[]): Producto|null{
   for(let i=0;i<ord.length;i++){ const s=sing(ord[i]); const h=disp.find(function(p){ return norm(p.nombre_completo).indexOf(s)!==-1 }); if(h) return h }
   return null
 }
-
+function buscarPorTallaColor(msg:string, disp:Producto[]): Producto[]{
+  const n=norm(msg)
+  return disp.filter(function(p){
+    if(p.talla && n.indexOf(norm(p.talla))!==-1) return true
+    if(p.color && n.indexOf(norm(p.color))!==-1) return true
+    return false
+  }).slice(0,8)
+}
 function faltantes(st:Estado){
   const f=[]; if(!st.nombre_cliente) f.push('📝 *Nombre completo:*'); if(!st.direccion) f.push('📍 *Dirección:* colonia, municipio, depto'); if(!st.metodo_pago) f.push('💳 *Pago:* efectivo/transferencia'); return f.join('\n')
 }
@@ -140,29 +178,31 @@ async function miniAgenteTodd(tel:string, msg:string, st:Estado, disp:Producto[]
       const prod=disp.find(function(p){ return p.sku===st.last_sku })
       const nombreProd=prod?.nombre_completo || st.last_nombre || 'Producto'
       const total=prod?.precioNum||0
-      await supabase.from('whatsapp_orders').insert({ telefono:tel, nombre:st.nombre_cliente, telefono_cliente:tel, direccion:st.direccion, items:[{sku:st.last_sku,nombre:nombreProd,qty:1,precio:total}], total, estado:'nuevo', metodo_pago:st.metodo_pago })
+      await supabase.from('whatsapp_orders').insert({ telefono:tel, nombre:st.nombre_cliente, telefono_cliente:tel, direccion:st.direccion, items:[{sku:st.last_sku,nombre:nombreProd,qty:1,precio:total, talla:prod?.talla||null, color:prod?.color||null}], total, estado:'nuevo', metodo_pago:st.metodo_pago })
       st.paso='confirmado'; await saveState(st)
-      return `✅ *PEDIDO CONFIRMADO* 🎉\n\n🛍 ${nombreProd}\n💰 Total: *${fmtPrecio(total)}*\n👤 ${st.nombre_cliente}\n📍 ${st.direccion}\n💳 ${st.metodo_pago}\n\n🚚 *Envío GRATIS 24-72h*\n¡Gracias! Soy Todd 💛`
+      return `✅ *PEDIDO CONFIRMADO* 🎉\n\n🛍 ${nombreProd}${prod?.talla?` - Talla ${prod.talla}`:''}${prod?.color?` - ${prod.color}`:''}\n💰 Total: *${fmtPrecio(total)}*\n👤 ${st.nombre_cliente}\n📍 ${st.direccion}\n💳 ${st.metodo_pago}\n\n🚚 *Envío GRATIS 24-72h*\n¡Gracias! Soy Todd 💛`
     }
     await saveState(st)
     return `¡Perfecto! Soy Todd 😊 Solo me falta:\n\n${faltantes(st)}`
   }
   if(esSaludo(msg)){ return `¡Hola! 👋 Soy *Todd* de TodoEnUno SV 💛\nTenemos *${disp.length}* productos con envío gratis 🚚\n\n¿Qué te gustaría ver?\n👉 Responde: catalogo\n👉 Responde: asesor` }
+  if(esTallaColor(msg)){
+    const filtrados=buscarPorTallaColor(msg,disp)
+    if(filtrados.length){
+      const lista=filtrados.map(function(p){ return `• *${p.nombre_completo}* - Talla ${p.talla||'única'} - ${p.color||'varios'} - ${fmtPrecio(p.precioNum)}` }).join('\n')
+      return `¡Sí! Encontré en esa talla/color ✨\n\n${lista}\n\nDecime cuál te gusta 😊 Soy Todd`
+    }
+  }
   if(esComoPedir(msg)){ if(st.last_sku){ st.paso='recolectando'; await saveState(st); return `¡Muy fácil! Soy Todd 😊 Solo necesito:\n\n${faltantes(st)}\n\nY listo, envío GRATIS 24-72h 🚚` } return `¡Fácil! Soy Todd 😊 Elegí un producto, escribe *Lo quiero* y te pido nombre, dirección y forma de pago. Envío GRATIS 🚚` }
   if(esPedir(msg) || n==='lo quiero'){
     const prodMsg=buscarProducto(msg,disp)
     if(prodMsg){ st.last_sku=prodMsg.sku; st.last_nombre=prodMsg.nombre_completo }
     if(st.last_sku){ st.paso='recolectando'; await saveState(st); return `¡Excelente elección! 🎉 Soy Todd y te aparto *${st.last_nombre}*\n\n${faltantes(st)}` }
   }
-  if(esDuda(msg)){ return `¡Claro! Soy Todd 😊 Preguntame lo que quieras. Envío GRATIS 24-72h, pagás efectivo o transferencia 💳` }
-  if(esListar(msg)){
-    const lista=disp.slice(0,7).map(function(p){ return `• *${p.nombre_completo}* - ${fmtPrecio(p.precioNum)}` }).join('\n')
-    return `¡Mirá lo que tenemos! ✨\n\n${lista}\n\nEscribime el nombre del que te guste 😊\nSoy Todd`
-  }
+  if(esListar(msg)){ return `¡Mirá lo que tenemos! ✨ Todo disponible 😊\n\n${listarConTallaColor(disp)}\n\nEscribime el nombre del que te guste, con talla y color si aplica 😊\nSoy Todd` }
   const prod=buscarProducto(msg,disp)
-  if(prod){ st.last_sku=prod.sku; st.last_nombre=prod.nombre_completo; st.paso='info'; await saveState(st); return fichaProducto(prod) }
-  const lista=disp.slice(0,7).map(function(p){ return `• *${p.nombre_completo}* - ${fmtPrecio(p.precioNum)}` }).join('\n')
-  return `Esa no la tengo a mano, pero soy Todd y mirá lo que sí tenemos 💛\n\n${lista}\n\nEscribí el nombre, por ejemplo: porta bebe`
+  if(prod){ st.last_sku=prod.sku; st.last_nombre=prod.nombre_completo; st.paso='info'; await saveState(st); return fichaProductoNatural(prod) }
+  return `Esa no la tengo a mano, pero soy Todd y mirá lo que sí tenemos, todo disponible 💛\n\n${listarConTallaColor(disp)}\n\nEscribí el nombre, por ejemplo: porta bebe`
 }
 
 export async function POST(req: NextRequest){
@@ -183,7 +223,7 @@ export async function POST(req: NextRequest){
     await sendText(number, texto)
     await saveConv(tel, raw, texto)
     return NextResponse.json({ok:true})
-  }catch(e:any){ console.error('webhook todd',e); return NextResponse.json({ok:true}) }
+  }catch(e:any){ console.error('webhook todd natural',e); return NextResponse.json({ok:true}) }
 }
 
-export async function GET(){ return NextResponse.json({ ok:true, service:'todoenuno-todd-intermedio-es5', instance:EVO_INSTANCE, name:'Todd' }) }
+export async function GET(){ return NextResponse.json({ ok:true, service:'todoenuno-todd-v50-natural-filter', instance:EVO_INSTANCE, agent:'Todd', eee:'eee', filtro:'NO_DISPONIBLE excluido, DISPONIBLE y es_test TRUE incluidos sin stock' }) }
